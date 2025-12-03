@@ -6,8 +6,9 @@ from decimal import Decimal
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message, CallbackQuery, FSInputFile # <-- FSInputFile добавлен
+from aiogram.types import Message, CallbackQuery, FSInputFile
 from aiogram.filters import Command
+from aiogram.client.default import DefaultBotProperties # <-- ИСПРАВЛЕНИЕ 2: Для корректной инициализации Bot
 
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -31,10 +32,7 @@ if not TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
 DB_URL = os.getenv("DB_URL", "sqlite+aiosqlite:////var/data/data.db")
-# 1. КОНСТАНТА: Определяем путь к файлу БД
-# Это нужно для FSInputFile, если используется sqlite+aiosqlite:////path/to/file.db
 # Из DB_URL извлекаем путь, предполагая формат 'sqlite+aiosqlite:////path'
-# В вашем случае, это, вероятно, /var/data/data.db
 DB_FILE_PATH = "/var/data/data.db" 
 
 ADMIN_USER_IDS = set(
@@ -246,7 +244,7 @@ def main_menu_kb():
     kb.adjust(2)
 
     kb.button(text="🏦 Банки")
-    kb.button(text="⚙️ Скачать файл БД") # <-- НОВАЯ КНОПКА
+    kb.button(text="⚙️ Скачать файл БД")
     kb.adjust(1)
 
     kb.button(text="❌ Отмена")
@@ -461,7 +459,7 @@ MENU_TEXTS = {
     "📦 Остатки", "💰 Деньги", "🟢 Приход", "🔴 Продажа",
     "📄 Приходы", "📄 Продажи", "📋 Должники", "➕ Добавить должн...",
     "🏬 Склады", "🧺 Товары", "🏦 Банки",
-    "⚙️ Скачать файл БД", # <-- ДОБАВЛЕНО
+    "⚙️ Скачать файл БД",
     "❌ Отмена",
     "➕ Добавить склад", "📃 Список складов", "🗑 Удалить склад",
     "➕ Добавить товар", "📃 Список товаров", "🗑 Удалить товар",
@@ -554,7 +552,7 @@ async def menu_anywhere(message: Message, state: FSMContext):
         await state.clear()
         return await message.answer("Меню:", reply_markup=main_menu_kb())
 
-    if text == "⚙️ Скачать файл БД": # <-- ОБРАБОТЧИК ДЛЯ НОВОЙ КНОПКИ
+    if text == "⚙️ Скачать файл БД":
         await state.clear()
         return await send_db_file(message)
     
@@ -662,7 +660,6 @@ async def cmd_start(message: Message, state: FSMContext):
 async def send_db_file(message: Message):
     """Обработчик для отправки файла БД."""
     
-    # 2. ПРОВЕРКА И ОТПРАВКА: Проверяем наличие файла и отправляем его
     if not os.path.exists(DB_FILE_PATH):
         return await message.answer(
             f"❌ Файл БД не найден по пути: `{DB_FILE_PATH}`. Проверьте конфигурацию.", 
@@ -1183,9 +1180,14 @@ async def cb_inc_nav(cq: CallbackQuery, state: FSMContext):
 # --- Warehouse step handler ---
 @router.callback_query(F.data.startswith("inc_wh:"))
 async def inc_choose_wh(cq: CallbackQuery, state: FSMContext):
+    # ИСПРАВЛЕНИЕ 1: Безопасный разбор callback_data
     parts = cq.data.split(":", 2)
+    
+    if len(parts) < 2:
+        return await cq.answer("Ошибка: неверный формат callback_data.", show_alert=True)
+    
     prefix, action = parts[0], parts[1]
-    rest = parts[2] if len(parts) == 3 else None # 🐛 ИСПРАВЛЕНИЕ: Безопасное получение rest
+    rest = parts[2] if len(parts) == 3 else None
 
     await cq.answer()
 
@@ -1246,7 +1248,8 @@ async def inc_add_warehouse_input(message: Message, state: FSMContext):
 
 # ===================== Main Loop =====================
 async def main():
-    bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
+    # ИСПРАВЛЕНИЕ 2: Использование DefaultBotProperties
+    bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     
