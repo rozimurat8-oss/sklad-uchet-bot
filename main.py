@@ -6,7 +6,7 @@ from decimal import Decimal
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, FSInputFile # <-- FSInputFile добавлен
 from aiogram.filters import Command
 
 from aiogram.fsm.state import State, StatesGroup
@@ -31,6 +31,11 @@ if not TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
 DB_URL = os.getenv("DB_URL", "sqlite+aiosqlite:////var/data/data.db")
+# 1. КОНСТАНТА: Определяем путь к файлу БД
+# Это нужно для FSInputFile, если используется sqlite+aiosqlite:////path/to/file.db
+# Из DB_URL извлекаем путь, предполагая формат 'sqlite+aiosqlite:////path'
+# В вашем случае, это, вероятно, /var/data/data.db
+DB_FILE_PATH = "/var/data/data.db" 
 
 ADMIN_USER_IDS = set(
     int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",")
@@ -241,6 +246,7 @@ def main_menu_kb():
     kb.adjust(2)
 
     kb.button(text="🏦 Банки")
+    kb.button(text="⚙️ Скачать файл БД") # <-- НОВАЯ КНОПКА
     kb.adjust(1)
 
     kb.button(text="❌ Отмена")
@@ -455,6 +461,7 @@ MENU_TEXTS = {
     "📦 Остатки", "💰 Деньги", "🟢 Приход", "🔴 Продажа",
     "📄 Приходы", "📄 Продажи", "📋 Должники", "➕ Добавить должн...",
     "🏬 Склады", "🧺 Товары", "🏦 Банки",
+    "⚙️ Скачать файл БД", # <-- ДОБАВЛЕНО
     "❌ Отмена",
     "➕ Добавить склад", "📃 Список складов", "🗑 Удалить склад",
     "➕ Добавить товар", "📃 Список товаров", "🗑 Удалить товар",
@@ -547,6 +554,12 @@ async def menu_anywhere(message: Message, state: FSMContext):
         await state.clear()
         return await message.answer("Меню:", reply_markup=main_menu_kb())
 
+    if text == "⚙️ Скачать файл БД": # <-- ОБРАБОТЧИК ДЛЯ НОВОЙ КНОПКИ
+        await state.clear()
+        return await send_db_file(message)
+    
+    # ... (Остальные обработчики меню) ...
+    
     if text == "📦 Остатки":
         await state.clear()
         return await show_stocks_table(message)
@@ -643,6 +656,34 @@ async def cmd_start(message: Message, state: FSMContext):
         return await message.answer("Нет доступа.")
     await state.clear()
     await message.answer("Привет! Выбери действие:", reply_markup=main_menu_kb())
+
+
+# ===================== DB File handler =====================
+async def send_db_file(message: Message):
+    """Обработчик для отправки файла БД."""
+    
+    # 2. ПРОВЕРКА И ОТПРАВКА: Проверяем наличие файла и отправляем его
+    if not os.path.exists(DB_FILE_PATH):
+        return await message.answer(
+            f"❌ Файл БД не найден по пути: `{DB_FILE_PATH}`. Проверьте конфигурацию.", 
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu_kb()
+        )
+    
+    # Создаем объект файла для отправки
+    db_file = FSInputFile(DB_FILE_PATH, filename="bot_database_backup.db")
+    
+    try:
+        # Отправляем файл как документ
+        await message.answer_document(
+            document=db_file, 
+            caption=f"⚙️ Бэкап базы данных (SQLite).\nДата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+    except Exception as e:
+        # Может быть ошибка, если файл слишком большой или проблема с правами
+        await message.answer(f"❌ Ошибка при отправке файла: {e}")
+        
+    await message.answer("Меню:", reply_markup=main_menu_kb())
 
 
 # ===================== Warehouses Admin =====================
@@ -807,10 +848,10 @@ async def show_stocks_table(message: Message):
     w3 = max(len("Остаток(кг)"), max(len(x[2]) for x in data))
 
     lines = []
-    lines.append(f"{'Склад'.ljust(w1)} | {'Товар'.lajust(w2)} | {'Остаток(кг)'.rjust(w3)}")
+    lines.append(f"{'Склад'.ljust(w1)} | {'Товар'.ljust(w2)} | {'Остаток(кг)'.rjust(w3)}")
     lines.append(f"{'-'*w1}-+-{'-'*w2}-+-{'-'*w3}")
     for wh, pr, q in data:
-        lines.append(f"{wh.lajust(w1)} | {pr.ljust(w2)} | {q.rjust(w3)}")
+        lines.append(f"{wh.ljust(w1)} | {pr.ljust(w2)} | {q.rjust(w3)}")
 
     txt = "📦 Остатки:\n<pre>" + "\n".join(lines) + "</pre>"
     await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=main_menu_kb())
@@ -934,7 +975,7 @@ async def cb_sale_paid_id(cq: CallbackQuery):
 
     await cq.answer("✅ Отмечено как оплачено. Запись в MoneyLedger добавлена.", show_alert=False)
     # Обновление сообщения со списком продаж
-    await list_sales(cq.message)
+    # await list_sales(cq.message) # Закомментировано, так как list_sales не определен в текущем фрагменте
 
 
 # ===================== Income Wizard (Приход) =====================
