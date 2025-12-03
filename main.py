@@ -18,7 +18,7 @@ from aiogram.enums.parse_mode import ParseMode
 
 from sqlalchemy import (
     String, Integer, Numeric, Date, DateTime, ForeignKey, Boolean,
-    select, func, delete, case
+    select, func, delete, case, update
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -937,17 +937,38 @@ async def cb_sale_paid_id(cq: CallbackQuery):
 
 @router.callback_query(F.data.startswith("sale_del:"))
 async def cb_sale_del(cq: CallbackQuery):
-    sale_id = int(cq.data.split(":", 1)[1])
+    part = cq.data.split(":", 1)[1]
+    if not part.isdigit():
+        return await cq.answer("Ошибка кнопки", show_alert=True)
+    sale_id = int(part)
+
     async with Session() as s:
         sale = await s.get(Sale, sale_id)
         if not sale:
             return await cq.answer("Не найдено", show_alert=True)
 
+        # 1) вернуть товар на склад
+        stock = await get_stock_row(s, sale.warehouse_id, sale.product_id)
+        stock.qty_kg = Decimal(stock.qty_kg) + Decimal(sale.qty_kg)
+
+        # 2) если продажа была оплачена — удалить запись из денег
+        if sale.is_paid:
+            await s.execute(
+                delete(MoneyLedger).where(
+                    MoneyLedger.direction == "in",
+                    MoneyLedger.entry_date == sale.doc_date,
+                    MoneyLedger.amount == sale.total_amount,
+                    MoneyLedger.note.like(f"Продажа #{sale.id}%")
+                )
+            )
+
+        # 3) удалить продажу
         await s.execute(delete(Sale).where(Sale.id == sale_id))
         await s.commit()
 
-    await cq.message.answer(f"🗑 Продажа #{sale_id} удалена.")
+    await cq.message.answer(f"🗑 Продажа #{sale_id} удалена (остатки восстановлены).")
     await cq.answer()
+
 
 
 async def list_sales(message: Message):
@@ -1022,15 +1043,43 @@ def income_actions_kb(income_id: int):
 
 @router.callback_query(F.data.startswith("inc_del:"))
 async def cb_inc_del(cq: CallbackQuery):
-    income_id = int(cq.data.split(":", 1)[1])
+    part = cq.data.split(":", 1)[1]
+    if not part.isdigit():
+        return await cq.answer("Ошибка кнопки", show_alert=True)
+    income_id = int(part)
+
     async with Session() as s:
         inc = await s.get(Income, income_id)
         if not inc:
             return await cq.answer("Не найдено", show_alert=True)
+
+        # 1) убрать товар со склада (и защититься от минуса)
+        stock = await get_stock_row(s, inc.warehouse_id, inc.product_id)
+        if Decimal(stock.qty_kg) < Decimal(inc.qty_kg):
+            return await cq.answer(
+                "Нельзя удалить: после удаления прихода остаток уйдёт в минус.",
+                show_alert=True
+            )
+        stock.qty_kg = Decimal(stock.qty_kg) - Decimal(inc.qty_kg)
+
+        # 2) если по приходу был расход денег — удалить запись
+        if inc.add_money_entry:
+            await s.execute(
+                delete(MoneyLedger).where(
+                    MoneyLedger.direction == "out",
+                    MoneyLedger.entry_date == inc.doc_date,
+                    MoneyLedger.amount == inc.total_amount,
+                    MoneyLedger.note.like(f"Приход #{inc.id}%")
+                )
+            )
+
+        # 3) удалить приход
         await s.execute(delete(Income).where(Income.id == income_id))
         await s.commit()
-    await cq.message.answer(f"🗑 Приход #{income_id} удалён.")
+
+    await cq.message.answer(f"🗑 Приход #{income_id} удалён (остатки пересчитаны).")
     await cq.answer()
+
 
 
 async def list_incomes(message: Message):
@@ -1667,16 +1716,37 @@ async def sale_confirm(cq: CallbackQuery, state: FSMContext):
                 await cq.answer("Банк не найден", show_alert=True)
                 return
 
-        stock = await get_stock_row(s, w.id, p.id)
-        if Decimal(stock.qty_kg) < qty:
-            await state.clear()
-            await cq.message.answer(
-                f"❗ Недостаточно товара.\nЕсть: {fmt_kg(stock.qty_kg)} кг, нужно: {fmt_kg(qty)} кг",
-                reply_markup=main_menu_kb()
-            )
-            return await cq.answer()
+        # гарантируем наличие строки stock (если её нет — создастся с 0)
+await get_stock_row(s, w.id, p.id)
 
-        stock.qty_kg = Decimal(stock.qty_kg) - qty
+# атомарно списываем, только если хватает остатка
+res = await s.execute(
+    update(Stock)
+    .where(
+        Stock.warehouse_id == w.id,
+        Stock.product_id == p.id,
+        Stock.qty_kg >= qty
+    )
+    .values(qty_kg=Stock.qty_kg - qty)
+)
+
+if res.rowcount == 0:
+    # покажем реальный остаток
+    cur_qty = await s.scalar(
+        select(Stock.qty_kg).where(
+            Stock.warehouse_id == w.id,
+            Stock.product_id == p.id
+        )
+    )
+    cur_qty = Decimal(cur_qty or 0)
+
+    await state.clear()
+    await cq.message.answer(
+        f"❗ Недостаточно товара.\nЕсть: {fmt_kg(cur_qty)} кг, нужно: {fmt_kg(qty)} кг",
+        reply_markup=main_menu_kb()
+    )
+    return await cq.answer()
+
 
         sale = Sale(
             doc_date=doc_date,
@@ -2480,6 +2550,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
