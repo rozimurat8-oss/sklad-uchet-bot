@@ -32,7 +32,7 @@ ADMIN_USER_IDS = set(
     int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()
 )
 
-DB_URL = "DB_URL = "sqlite+aiosqlite:////var/data/data.db"
+DB_URL = "sqlite+aiosqlite:////var/data/data.db"
 
 
 # ----------------- DB Models -----------------
@@ -1139,4 +1139,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
