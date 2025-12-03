@@ -1748,7 +1748,7 @@ if res.rowcount == 0:
     return await cq.answer()
 
 
-        sale = Sale(
+sale = Sale(
             doc_date=doc_date,
             customer_name=customer_name,
             customer_phone=customer_phone,
@@ -2550,6 +2550,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
