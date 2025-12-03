@@ -1,7 +1,7 @@
 import os
 import asyncio
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 
 from dotenv import load_dotenv
 
@@ -18,7 +18,7 @@ from aiogram.enums.parse_mode import ParseMode
 
 from sqlalchemy import (
     String, Integer, Numeric, Date, DateTime, ForeignKey, Boolean,
-    select, func, delete, update
+    select, func, delete
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -31,7 +31,6 @@ if not TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
 # Render persistent disk path:
-# IMPORTANT: 4 slashes after sqlite+aiosqlite:
 DB_URL = os.getenv("DB_URL", "sqlite+aiosqlite:////var/data/data.db")
 
 ADMIN_USER_IDS = set(
@@ -126,7 +125,6 @@ class Income(Base):
     total_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2))
     delivery_cost: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=Decimal("0.00"))
 
-    # money (optional)
     add_money_entry: Mapped[bool] = mapped_column(Boolean, default=False)
     payment_method: Mapped[str] = mapped_column(String(10), default="")
     bank: Mapped[str] = mapped_column(String(120), default="")
@@ -136,10 +134,6 @@ class Income(Base):
 
 
 class Debtor(Base):
-    """
-    Должник: может появляться из продажи (не оплачено) или вручную.
-    Можно отметить как оплачено.
-    """
     __tablename__ = "debtors"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
@@ -174,20 +168,20 @@ def is_admin(user_id: int) -> bool:
 
 
 def dec(s: str) -> Decimal:
-    s = s.strip().replace(",", ".")
+    s = (s or "").strip().replace(",", ".")
     return Decimal(s)
 
 
 def fmt_money(x: Decimal) -> str:
-    return f"{x:.2f}"
+    return f"{Decimal(x):.2f}"
 
 
 def fmt_kg(x: Decimal) -> str:
-    return f"{x:.3f}".rstrip("0").rstrip(".")
+    return f"{Decimal(x):.3f}".rstrip("0").rstrip(".")
 
 
 def safe_phone(s: str) -> str:
-    return s.strip()
+    return (s or "").strip()
 
 
 def main_menu_kb():
@@ -226,10 +220,11 @@ def yes_no_kb(prefix: str):
     return ikb.as_markup()
 
 
-def paid_kb(prefix: str):
+# ВАЖНО: статус оплаты у визарда — отдельный префикс, чтобы не конфликтовал с кнопками продажи по ID
+def sale_status_kb():
     ikb = InlineKeyboardBuilder()
-    ikb.button(text="✅ Оплачено", callback_data=f"{prefix}:paid")
-    ikb.button(text="🧾 Не оплачено", callback_data=f"{prefix}:unpaid")
+    ikb.button(text="✅ Оплачено", callback_data="sale_status:paid")
+    ikb.button(text="🧾 Не оплачено", callback_data="sale_status:unpaid")
     ikb.adjust(2)
     return ikb.as_markup()
 
@@ -285,7 +280,7 @@ class DebtorWizard(StatesGroup):
     confirm = State()
 
 
-# ===================== Router & Bot =====================
+# ===================== Router =====================
 router = Router()
 
 MENU_TEXTS = {
@@ -331,31 +326,7 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer("Привет! Выбери действие:", reply_markup=main_menu_kb())
 
 
-# ===================== Core actions =====================
-async def get_or_create_warehouse(name: str) -> Warehouse:
-    name = name.strip()
-    async with Session() as s:
-        w = await s.scalar(select(Warehouse).where(Warehouse.name == name))
-        if w:
-            return w
-        w = Warehouse(name=name)
-        s.add(w)
-        await s.commit()
-        return w
-
-
-async def get_or_create_product(name: str) -> Product:
-    name = name.strip()
-    async with Session() as s:
-        p = await s.scalar(select(Product).where(Product.name == name))
-        if p:
-            return p
-        p = Product(name=name)
-        s.add(p)
-        await s.commit()
-        return p
-
-
+# ===================== Core DB helpers =====================
 async def get_stock_row(session, warehouse_id: int, product_id: int) -> Stock:
     row = await session.scalar(
         select(Stock).where(
@@ -371,6 +342,7 @@ async def get_stock_row(session, warehouse_id: int, product_id: int) -> Stock:
     return row
 
 
+# ===================== Stocks / Money =====================
 async def show_stocks(message: Message):
     async with Session() as s:
         rows = (await s.execute(
@@ -384,7 +356,7 @@ async def show_stocks(message: Message):
 
     lines = ["📦 *Остатки:*"]
     for r in rows:
-        if r.qty_kg and r.qty_kg != 0:
+        if r.qty_kg and Decimal(r.qty_kg) != 0:
             lines.append(f"• {r.warehouse.name} — {r.product.name}: *{fmt_kg(r.qty_kg)} кг*")
     if len(lines) == 1:
         lines.append("Пока везде 0.")
@@ -393,14 +365,20 @@ async def show_stocks(message: Message):
 
 async def show_money(message: Message):
     async with Session() as s:
-        total_in = await s.scalar(select(func.coalesce(func.sum(MoneyLedger.amount), 0)).where(MoneyLedger.direction == "in"))
-        total_out = await s.scalar(select(func.coalesce(func.sum(MoneyLedger.amount), 0)).where(MoneyLedger.direction == "out"))
-    balance = Decimal(total_in) - Decimal(total_out)
+        total_in = await s.scalar(
+            select(func.coalesce(func.sum(MoneyLedger.amount), 0)).where(MoneyLedger.direction == "in")
+        )
+        total_out = await s.scalar(
+            select(func.coalesce(func.sum(MoneyLedger.amount), 0)).where(MoneyLedger.direction == "out")
+        )
+    total_in = Decimal(total_in)
+    total_out = Decimal(total_out)
+    balance = total_in - total_out
 
     txt = (
         "💰 *Деньги:*\n"
-        f"Приход: *{fmt_money(Decimal(total_in))}*\n"
-        f"Расход: *{fmt_money(Decimal(total_out))}*\n"
+        f"Приход: *{fmt_money(total_in)}*\n"
+        f"Расход: *{fmt_money(total_out)}*\n"
         f"Баланс: *{fmt_money(balance)}*"
     )
     await message.answer(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb())
@@ -410,15 +388,21 @@ async def show_money(message: Message):
 def sales_actions_kb(sale_id: int, paid: bool):
     ikb = InlineKeyboardBuilder()
     if not paid:
-        ikb.button(text="✅ Отметить как оплачено", callback_data=f"sale_paid:{sale_id}")
+        # ВАЖНО: другой префикс, чтобы не конфликтовать с sale_status
+        ikb.button(text="✅ Отметить как оплачено", callback_data=f"sale_paid_id:{sale_id}")
     ikb.button(text="🗑 Удалить", callback_data=f"sale_del:{sale_id}")
     ikb.adjust(1)
     return ikb.as_markup()
 
 
-@router.callback_query(F.data.startswith("sale_paid:"))
-async def cb_sale_paid(cq: CallbackQuery):
-    sale_id = int(cq.data.split(":")[1])
+@router.callback_query(F.data.startswith("sale_paid_id:"))
+async def cb_sale_paid_id(cq: CallbackQuery):
+    part = cq.data.split(":", 1)[1]
+    if not part.isdigit():
+        return await cq.answer("Ошибка кнопки. Обнови сообщение.", show_alert=True)
+
+    sale_id = int(part)
+
     async with Session() as s:
         sale = await s.get(Sale, sale_id)
         if not sale:
@@ -427,7 +411,8 @@ async def cb_sale_paid(cq: CallbackQuery):
             return await cq.answer("Уже оплачено", show_alert=True)
 
         sale.is_paid = True
-        # добавить поступление денег, если раньше не добавляли
+
+        # Добавим деньги только если метод задан (в старых записях может быть пусто)
         if sale.payment_method:
             s.add(MoneyLedger(
                 entry_date=sale.doc_date,
@@ -438,11 +423,15 @@ async def cb_sale_paid(cq: CallbackQuery):
                 note=f"Оплата по продаже #{sale.id} ({sale.customer_name})"
             ))
 
-        # найти должника и закрыть (если был)
-        d = await s.scalar(select(Debtor).where(Debtor.customer_name == sale.customer_name,
-                                               Debtor.customer_phone == sale.customer_phone,
-                                               Debtor.total_amount == sale.total_amount,
-                                               Debtor.is_paid == False))
+        # Закрыть должника (если есть похожий)
+        d = await s.scalar(
+            select(Debtor).where(
+                Debtor.customer_name == sale.customer_name,
+                Debtor.customer_phone == sale.customer_phone,
+                Debtor.total_amount == sale.total_amount,
+                Debtor.is_paid == False
+            )
+        )
         if d:
             d.is_paid = True
 
@@ -454,14 +443,12 @@ async def cb_sale_paid(cq: CallbackQuery):
 
 @router.callback_query(F.data.startswith("sale_del:"))
 async def cb_sale_del(cq: CallbackQuery):
-    sale_id = int(cq.data.split(":")[1])
+    sale_id = int(cq.data.split(":", 1)[1])
     async with Session() as s:
         sale = await s.get(Sale, sale_id)
         if not sale:
             return await cq.answer("Не найдено", show_alert=True)
 
-        # ВНИМАНИЕ: при удалении продажи мы НЕ возвращаем товар назад.
-        # Если нужно — можно добавить отдельную кнопку "Отменить продажу" с обратным движением.
         await s.execute(delete(Sale).where(Sale.id == sale_id))
         await s.commit()
 
@@ -488,8 +475,9 @@ async def list_sales(message: Message):
             f"\n*#{r.id}* {paid} {r.doc_date} — {r.customer_name} ({r.customer_phone})\n"
             f"{r.warehouse.name} / {r.product.name} — {fmt_kg(r.qty_kg)} кг × {fmt_money(r.price_per_kg)} = *{fmt_money(r.total_amount)}*"
         )
+
     await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb())
-    await message.answer("Чтобы управлять записью: напиши `продажа #ID` например: `продажа #12`",
+    await message.answer("Чтобы управлять: напиши `продажа #ID` например: `продажа #12`",
                          reply_markup=main_menu_kb())
 
 
@@ -532,12 +520,11 @@ def income_actions_kb(income_id: int):
 
 @router.callback_query(F.data.startswith("inc_del:"))
 async def cb_inc_del(cq: CallbackQuery):
-    income_id = int(cq.data.split(":")[1])
+    income_id = int(cq.data.split(":", 1)[1])
     async with Session() as s:
         inc = await s.get(Income, income_id)
         if not inc:
             return await cq.answer("Не найдено", show_alert=True)
-        # ВНИМАНИЕ: при удалении прихода мы НЕ уменьшаем склад назад.
         await s.execute(delete(Income).where(Income.id == income_id))
         await s.commit()
     await cq.message.answer(f"🗑 Приход #{income_id} удалён.")
@@ -562,6 +549,7 @@ async def list_incomes(message: Message):
             f"\n*#{r.id}* {r.doc_date} — {r.supplier_name} ({r.supplier_phone})\n"
             f"{r.warehouse.name} / {r.product.name} — {fmt_kg(r.qty_kg)} кг × {fmt_money(r.price_per_kg)} = *{fmt_money(r.total_amount)}*"
         )
+
     await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb())
     await message.answer("Чтобы посмотреть: напиши `приход #ID` например: `приход #7`",
                          reply_markup=main_menu_kb())
@@ -606,7 +594,7 @@ def debtor_actions_kb(debtor_id: int, paid: bool):
 
 @router.callback_query(F.data.startswith("deb_paid:"))
 async def cb_deb_paid(cq: CallbackQuery):
-    debtor_id = int(cq.data.split(":")[1])
+    debtor_id = int(cq.data.split(":", 1)[1])
     async with Session() as s:
         d = await s.get(Debtor, debtor_id)
         if not d:
@@ -619,7 +607,7 @@ async def cb_deb_paid(cq: CallbackQuery):
 
 @router.callback_query(F.data.startswith("deb_del:"))
 async def cb_deb_del(cq: CallbackQuery):
-    debtor_id = int(cq.data.split(":")[1])
+    debtor_id = int(cq.data.split(":", 1)[1])
     async with Session() as s:
         await s.execute(delete(Debtor).where(Debtor.id == debtor_id))
         await s.commit()
@@ -643,6 +631,7 @@ async def list_debtors(message: Message):
             f"\n*#{r.id}* {status} {r.doc_date} — {r.customer_name} ({r.customer_phone})\n"
             f"{r.warehouse_name} / {r.product_name} — {fmt_kg(r.qty_kg)} кг × {fmt_money(r.price_per_kg)} = *{fmt_money(r.total_amount)}*"
         )
+
     await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb())
     await message.answer("Чтобы управлять: напиши `должник #ID` например: `должник #3`",
                          reply_markup=main_menu_kb())
@@ -682,7 +671,7 @@ async def start_sale(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("sale_date:"))
 async def cb_sale_date(cq: CallbackQuery, state: FSMContext):
-    choice = cq.data.split(":")[1]
+    choice = cq.data.split(":", 1)[1]
     if choice == "today":
         d = date.today()
         await state.update_data(doc_date=d.isoformat())
@@ -694,7 +683,6 @@ async def cb_sale_date(cq: CallbackQuery, state: FSMContext):
         await state.set_state(SaleWizard.customer_name)
         await cq.message.answer("Имя клиента (можно '-'):")
     else:
-        await state.update_data(doc_date="manual")
         await cq.message.answer("Введи дату в формате YYYY-MM-DD:")
     await cq.answer()
 
@@ -721,7 +709,7 @@ async def sale_customer_name(message: Message, state: FSMContext):
 async def sale_customer_phone(message: Message, state: FSMContext):
     await state.update_data(customer_phone=safe_phone(message.text))
     await state.set_state(SaleWizard.warehouse)
-    await message.answer("С какого склада? (напиши название склада):")
+    await message.answer("С какого склада? (название склада):")
 
 
 @router.message(SaleWizard.warehouse)
@@ -774,18 +762,17 @@ async def sale_delivery(message: Message, state: FSMContext):
         return await message.answer("Ошибка. Введи число, например 0 или 1500")
     await state.update_data(delivery=str(d))
     await state.set_state(SaleWizard.paid_status)
-    await message.answer("Статус оплаты:", reply_markup=paid_kb("sale_paid"))
+    await message.answer("Статус оплаты:", reply_markup=sale_status_kb())
 
 
-@router.callback_query(F.data.startswith("sale_paid:"))
+@router.callback_query(F.data.startswith("sale_status:"))
 async def cb_sale_paid_status(cq: CallbackQuery, state: FSMContext):
-    ch = cq.data.split(":")[1]
+    ch = cq.data.split(":", 1)[1]  # paid / unpaid
     if ch == "paid":
         await state.update_data(is_paid=True)
         await state.set_state(SaleWizard.pay_method)
         await cq.message.answer("Как оплатили?", reply_markup=pay_method_kb("sale_pay"))
     else:
-        # НЕ ОПЛАЧЕНО: не спрашиваем банк/метод, сразу подтверждение
         await state.update_data(is_paid=False, payment_method="", bank="")
         await state.set_state(SaleWizard.confirm)
         data = await state.get_data()
@@ -795,7 +782,7 @@ async def cb_sale_paid_status(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("sale_pay:"))
 async def cb_sale_pay_method(cq: CallbackQuery, state: FSMContext):
-    method = cq.data.split(":")[1]  # cash/noncash
+    method = cq.data.split(":", 1)[1]  # cash/noncash
     await state.update_data(payment_method=method)
     if method == "cash":
         await state.update_data(bank="")
@@ -843,7 +830,7 @@ def build_sale_summary(data: dict) -> str:
 
 @router.callback_query(F.data.startswith("sale_confirm:"))
 async def cb_sale_confirm(cq: CallbackQuery, state: FSMContext):
-    ch = cq.data.split(":")[1]
+    ch = cq.data.split(":", 1)[1]
     if ch == "no":
         await state.clear()
         await cq.message.answer("Отменено ✅", reply_markup=main_menu_kb())
@@ -880,7 +867,7 @@ async def cb_sale_confirm(cq: CallbackQuery, state: FSMContext):
             await s.flush()
 
         stock = await get_stock_row(s, w.id, p.id)
-        if stock.qty_kg < qty:
+        if Decimal(stock.qty_kg) < qty:
             await state.clear()
             await cq.message.answer(
                 f"❗ Недостаточно товара на складе.\n"
@@ -908,7 +895,6 @@ async def cb_sale_confirm(cq: CallbackQuery, state: FSMContext):
         s.add(sale)
         await s.flush()
 
-        # деньги добавляем ТОЛЬКО если оплачено
         if is_paid:
             s.add(MoneyLedger(
                 entry_date=d,
@@ -919,7 +905,6 @@ async def cb_sale_confirm(cq: CallbackQuery, state: FSMContext):
                 note=f"Продажа #{sale.id} ({customer_name})"
             ))
         else:
-            # в должники
             s.add(Debtor(
                 doc_date=d,
                 customer_name=customer_name,
@@ -949,7 +934,7 @@ async def start_income(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("inc_date:"))
 async def cb_income_date(cq: CallbackQuery, state: FSMContext):
-    choice = cq.data.split(":")[1]
+    choice = cq.data.split(":", 1)[1]
     if choice == "today":
         d = date.today()
         await state.update_data(doc_date=d.isoformat())
@@ -961,7 +946,6 @@ async def cb_income_date(cq: CallbackQuery, state: FSMContext):
         await state.set_state(IncomeWizard.supplier_name)
         await cq.message.answer("Имя поставщика (можно '-'):")
     else:
-        await state.update_data(doc_date="manual")
         await cq.message.answer("Введи дату в формате YYYY-MM-DD:")
     await cq.answer()
 
@@ -1046,7 +1030,7 @@ async def income_delivery(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("inc_money:"))
 async def cb_inc_money(cq: CallbackQuery, state: FSMContext):
-    ch = cq.data.split(":")[1]
+    ch = cq.data.split(":", 1)[1]
     if ch == "yes":
         await state.update_data(add_money_entry=True)
         await state.set_state(IncomeWizard.pay_method)
@@ -1061,7 +1045,7 @@ async def cb_inc_money(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("inc_pay:"))
 async def cb_inc_pay_method(cq: CallbackQuery, state: FSMContext):
-    method = cq.data.split(":")[1]
+    method = cq.data.split(":", 1)[1]
     await state.update_data(payment_method=method)
     if method == "cash":
         await state.update_data(bank="")
@@ -1109,7 +1093,7 @@ def build_income_summary(data: dict) -> str:
 
 @router.callback_query(F.data.startswith("inc_confirm:"))
 async def cb_income_confirm(cq: CallbackQuery, state: FSMContext):
-    ch = cq.data.split(":")[1]
+    ch = cq.data.split(":", 1)[1]
     if ch == "no":
         await state.clear()
         await cq.message.answer("Отменено ✅", reply_markup=main_menu_kb())
@@ -1165,7 +1149,6 @@ async def cb_income_confirm(cq: CallbackQuery, state: FSMContext):
         s.add(inc)
         await s.flush()
 
-        # Деньги: если включили — это расход (покупка товара)
         if add_money_entry:
             s.add(MoneyLedger(
                 entry_date=d,
@@ -1192,7 +1175,7 @@ async def start_debtor(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("deb_date:"))
 async def cb_deb_date(cq: CallbackQuery, state: FSMContext):
-    choice = cq.data.split(":")[1]
+    choice = cq.data.split(":", 1)[1]
     if choice == "today":
         d = date.today()
         await state.update_data(doc_date=d.isoformat())
@@ -1307,7 +1290,7 @@ def build_debtor_summary(data: dict) -> str:
 
 @router.callback_query(F.data.startswith("deb_confirm:"))
 async def cb_deb_confirm(cq: CallbackQuery, state: FSMContext):
-    ch = cq.data.split(":")[1]
+    ch = cq.data.split(":", 1)[1]
     if ch == "no":
         await state.clear()
         await cq.message.answer("Отменено ✅", reply_markup=main_menu_kb())
