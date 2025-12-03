@@ -1666,6 +1666,8 @@ def build_sale_summary(data: dict) -> str:
     )
 
 
+from sqlalchemy import update  # добавь в импорты сверху рядом с select/delete/case
+
 @router.callback_query(F.data.startswith("sale_confirm:"))
 async def sale_confirm(cq: CallbackQuery, state: FSMContext):
     ch = cq.data.split(":", 1)[1]
@@ -1692,15 +1694,22 @@ async def sale_confirm(cq: CallbackQuery, state: FSMContext):
 
     account_type = data.get("account_type", "cash")
     bank_id = data.get("bank_id")
+
     if account_type not in ("cash", "bank", "ip"):
         account_type = "cash"
-    if account_type == "cash":
-        bank_id = None
+
+    if is_paid:
+        if account_type == "cash":
+            bank_id = None
+        else:
+            if not bank_id:
+                return await cq.answer("Выбери банк/счёт", show_alert=True)
+            bank_id = int(bank_id)
     else:
-        if not bank_id:
-            await cq.answer("Выбери банк/счёт", show_alert=True)
-            return
-        bank_id = int(bank_id)
+        # если не оплачено — деньги не трогаем
+        payment_method = ""
+        account_type = "cash"
+        bank_id = None
 
     async with Session() as s:
         w = await s.get(Warehouse, warehouse_id)
@@ -1710,91 +1719,88 @@ async def sale_confirm(cq: CallbackQuery, state: FSMContext):
             await cq.message.answer("Ошибка: склад/товар не найден. Проверь справочники.", reply_markup=main_menu_kb())
             return await cq.answer()
 
-        if account_type in ("bank", "ip"):
+        if is_paid and account_type in ("bank", "ip"):
             b = await s.get(Bank, bank_id)
             if not b:
-                await cq.answer("Банк не найден", show_alert=True)
-                return
+                return await cq.answer("Банк не найден", show_alert=True)
 
-        # гарантируем наличие строки stock (если её нет — создастся с 0)
-            await get_stock_row(s, w.id, p.id)
+        # гарантируем, что строка Stock существует (если нет — создастся с 0)
+        await get_stock_row(s, w.id, p.id)
 
-# атомарно списываем, только если хватает остатка
-res = await s.execute(
-    update(Stock)
-    .where(
-        Stock.warehouse_id == w.id,
-        Stock.product_id == p.id,
-        Stock.qty_kg >= qty
-    )
-    .values(qty_kg=Stock.qty_kg - qty)
-)
-
-if res.rowcount == 0:
-    # покажем реальный остаток
-    cur_qty = await s.scalar(
-        select(Stock.qty_kg).where(
-            Stock.warehouse_id == w.id,
-            Stock.product_id == p.id
+        # атомарно списываем: обновим только если остатков хватает
+        res = await s.execute(
+            update(Stock)
+            .where(
+                Stock.warehouse_id == w.id,
+                Stock.product_id == p.id,
+                Stock.qty_kg >= qty
+            )
+            .values(qty_kg=Stock.qty_kg - qty)
         )
-    )
-    cur_qty = Decimal(cur_qty or 0)
+
+        if res.rowcount == 0:
+            cur_qty = await s.scalar(
+                select(Stock.qty_kg).where(
+                    Stock.warehouse_id == w.id,
+                    Stock.product_id == p.id
+                )
+            )
+            cur_qty = Decimal(cur_qty or 0)
+
+            await state.clear()
+            await cq.message.answer(
+                f"❗ Недостаточно товара.\nЕсть: {fmt_kg(cur_qty)} кг, нужно: {fmt_kg(qty)} кг",
+                reply_markup=main_menu_kb()
+            )
+            return await cq.answer()
+
+        sale = Sale(
+            doc_date=doc_date,
+            customer_name=customer_name,
+            customer_phone=customer_phone,
+            warehouse_id=w.id,
+            product_id=p.id,
+            qty_kg=qty,
+            price_per_kg=price,
+            total_amount=total,
+            delivery_cost=delivery,
+            is_paid=is_paid,
+            payment_method=payment_method,
+            account_type=account_type,
+            bank_id=bank_id
+        )
+        s.add(sale)
+        await s.flush()
+
+        if is_paid:
+            s.add(MoneyLedger(
+                entry_date=doc_date,
+                direction="in",
+                method=payment_method or "cash",
+                account_type=account_type,
+                bank_id=bank_id if account_type in ("bank", "ip") else None,
+                amount=total,
+                note=f"Продажа #{sale.id} ({customer_name})"
+            ))
+        else:
+            s.add(Debtor(
+                doc_date=doc_date,
+                customer_name=customer_name,
+                customer_phone=customer_phone,
+                warehouse_name=w.name,
+                product_name=p.name,
+                qty_kg=qty,
+                price_per_kg=price,
+                total_amount=total,
+                delivery_cost=delivery,
+                is_paid=False
+            ))
+
+        await s.commit()
 
     await state.clear()
-    await cq.message.answer(
-        f"❗ Недостаточно товара.\nЕсть: {fmt_kg(cur_qty)} кг, нужно: {fmt_kg(qty)} кг",
-        reply_markup=main_menu_kb()
-    )
-    return await cq.answer()
-
-sale = Sale(
-    doc_date=doc_date,
-    customer_name=customer_name,
-    customer_phone=customer_phone,
-    warehouse_id=w.id,
-    product_id=p.id,
-    qty_kg=qty,
-    price_per_kg=price,
-    total_amount=total,
-    delivery_cost=delivery,
-    is_paid=is_paid,
-    payment_method=payment_method if is_paid else "",
-    account_type=account_type if is_paid else "cash",
-    bank_id=bank_id if (is_paid and account_type in ("bank", "ip")) else None
-)
-s.add(sale)
-await s.flush()
-
-if is_paid:
-    s.add(MoneyLedger(
-        entry_date=doc_date,
-        direction="in",
-        method=payment_method or "cash",
-        account_type=account_type,
-        bank_id=bank_id if account_type in ("bank", "ip") else None,
-        amount=total,
-        note=f"Продажа #{sale.id} ({customer_name})"
-    ))
-else:
-    s.add(Debtor(
-        doc_date=doc_date,
-        customer_name=customer_name,
-        customer_phone=customer_phone,
-        warehouse_name=w.name,
-        product_name=p.name,
-        qty_kg=qty,
-        price_per_kg=price,
-        total_amount=total,
-        delivery_cost=delivery,
-        is_paid=False
-    ))
-
-await s.commit()
-
-
-await state.clear()
-await cq.message.answer("✅ Продажа сохранена.", reply_markup=main_menu_kb())
-await cq.answer()
+    await cq.message.answer("✅ Продажа сохранена.", reply_markup=main_menu_kb())
+    await cq.answer()
 
 
 # ===================== INCOME wizard =====================
@@ -2550,6 +2556,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
