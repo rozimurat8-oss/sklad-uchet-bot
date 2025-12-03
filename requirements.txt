@@ -1,4 +1,4 @@
-aiogram==3.*
-python-dotenv==1.*
-SQLAlchemy==2.*
-aiosqlite==0.21.*
+aiogram>=3.2
+SQLAlchemy>=2.0
+aiosqlite>=0.20
+python-dotenv>=1.0
