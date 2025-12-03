@@ -1729,67 +1729,66 @@ res = await s.execute(
     )
     .values(qty_kg=Stock.qty_kg - qty)
 )
-
-    if res.rowcount == 0:
-        # покажем реальный остаток
-        cur_qty = await s.scalar(
-            select(Stock.qty_kg).where(
-                Stock.warehouse_id == w.id,
-                Stock.product_id == p.id
-            )
+if res.rowcount == 0:
+    # покажем реальный остаток
+    cur_qty = await s.scalar(
+        select(Stock.qty_kg).where(
+            Stock.warehouse_id == w.id,
+            Stock.product_id == p.id
         )
-        cur_qty = Decimal(cur_qty or 0)
+    )
+    cur_qty = Decimal(cur_qty or 0)
 
-        await state.clear()
-        await cq.message.answer(
-            f"❗ Недостаточно товара.\nЕсть: {fmt_kg(cur_qty)} кг, нужно: {fmt_kg(qty)} кг",
-            reply_markup=main_menu_kb()
-        )
-        return await cq.answer()
+    await state.clear()
+    await cq.message.answer(
+        f"❗ Недостаточно товара.\nЕсть: {fmt_kg(cur_qty)} кг, нужно: {fmt_kg(qty)} кг",
+        reply_markup=main_menu_kb()
+    )
+    return await cq.answer()
 
-    sale = Sale(
+sale = Sale(
+    doc_date=doc_date,
+    customer_name=customer_name,
+    customer_phone=customer_phone,
+    warehouse_id=w.id,
+    product_id=p.id,
+    qty_kg=qty,
+    price_per_kg=price,
+    total_amount=total,
+    delivery_cost=delivery,
+    is_paid=is_paid,
+    payment_method=payment_method if is_paid else "",
+    account_type=account_type if is_paid else "cash",
+    bank_id=bank_id if (is_paid and account_type in ("bank", "ip")) else None
+)
+s.add(sale)
+await s.flush()
+
+if is_paid:
+    s.add(MoneyLedger(
+        entry_date=doc_date,
+        direction="in",
+        method=payment_method or "cash",
+        account_type=account_type,
+        bank_id=bank_id if account_type in ("bank", "ip") else None,
+        amount=total,
+        note=f"Продажа #{sale.id} ({customer_name})"
+    ))
+else:
+    s.add(Debtor(
         doc_date=doc_date,
         customer_name=customer_name,
         customer_phone=customer_phone,
-        warehouse_id=w.id,
-        product_id=p.id,
+        warehouse_name=w.name,
+        product_name=p.name,
         qty_kg=qty,
         price_per_kg=price,
         total_amount=total,
         delivery_cost=delivery,
-        is_paid=is_paid,
-        payment_method=payment_method if is_paid else "",
-        account_type=account_type if is_paid else "cash",
-        bank_id=bank_id if (is_paid and account_type in ("bank", "ip")) else None
-    )
-    s.add(sale)
-    await s.flush()
+        is_paid=False
+    ))
 
-    if is_paid:
-        s.add(MoneyLedger(
-            entry_date=doc_date,
-            direction="in",
-            method=payment_method or "cash",
-            account_type=account_type,
-            bank_id=bank_id if account_type in ("bank", "ip") else None,
-            amount=total,
-            note=f"Продажа #{sale.id} ({customer_name})"
-        ))
-    else:
-        s.add(Debtor(
-            doc_date=doc_date,
-            customer_name=customer_name,
-            customer_phone=customer_phone,
-            warehouse_name=w.name,
-            product_name=p.name,
-            qty_kg=qty,
-            price_per_kg=price,
-            total_amount=total,
-            delivery_cost=delivery,
-            is_paid=False
-        ))
-
-    await s.commit()
+await s.commit()
 
 
     await state.clear()
@@ -2550,6 +2549,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
