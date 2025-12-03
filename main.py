@@ -77,22 +77,6 @@ class Stock(Base):
 
 
 class MoneyLedger(Base):
-    """
-    direction:
-      - in  (приход денег)
-      - out (расход денег)
-
-    method:
-      - cash    (как оплатили)
-      - noncash
-
-    account_type (куда легло/откуда ушло):
-      - cash (наличные)
-      - bank (банк компании)
-      - ip   (счет ИП)
-
-    bank_id для bank/ip обязателен, для cash = None
-    """
     __tablename__ = "money_ledger"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
@@ -103,7 +87,7 @@ class MoneyLedger(Base):
 
     account_type: Mapped[str] = mapped_column(String(10), default="cash")  # cash/bank/ip
     bank_id: Mapped[int | None] = mapped_column(ForeignKey("banks.id"), nullable=True)
-    bank: Mapped[Bank | None] = relationship()
+    bank: Mapped["Bank | None"] = relationship()
 
     amount: Mapped[Decimal] = mapped_column(Numeric(18, 2))
     note: Mapped[str] = mapped_column(String(300), default="")
@@ -134,7 +118,7 @@ class Sale(Base):
 
     warehouse: Mapped[Warehouse] = relationship()
     product: Mapped[Product] = relationship()
-    bank: Mapped[Bank | None] = relationship()
+    bank: Mapped["Bank | None"] = relationship()
 
 
 class Income(Base):
@@ -162,7 +146,7 @@ class Income(Base):
 
     warehouse: Mapped[Warehouse] = relationship()
     product: Mapped[Product] = relationship()
-    bank: Mapped[Bank | None] = relationship()
+    bank: Mapped["Bank | None"] = relationship()
 
 
 class Debtor(Base):
@@ -213,6 +197,18 @@ def safe_text(s: str) -> str:
 
 def safe_phone(s: str) -> str:
     return (s or "").strip()
+
+
+def parse_cb(data: str, prefix: str):
+    """
+    Безопасный парсер callback_data.
+    Возвращает список частей ПОСЛЕ prefix.
+    Например: data="sale_pr:id:12", prefix="sale_pr" -> ["id","12"]
+    """
+    if not data or not data.startswith(prefix + ":"):
+        return []
+    rest = data[len(prefix) + 1 :]
+    return rest.split(":") if rest else []
 
 
 # ===================== Menus =====================
@@ -890,7 +886,7 @@ def sales_actions_kb(sale_id: int, paid: bool):
 
 @router.callback_query(F.data.startswith("sale_paid_id:"))
 async def cb_sale_paid_id(cq: CallbackQuery):
-    part = cq.data.split(":", 1)[1]
+    part = cq.data.split(":", 1)[1] if cq.data else ""
     if not part.isdigit():
         return await cq.answer("Ошибка кнопки. Обнови сообщение.", show_alert=True)
 
@@ -937,38 +933,20 @@ async def cb_sale_paid_id(cq: CallbackQuery):
 
 @router.callback_query(F.data.startswith("sale_del:"))
 async def cb_sale_del(cq: CallbackQuery):
-    part = cq.data.split(":", 1)[1]
+    part = cq.data.split(":", 1)[1] if cq.data else ""
     if not part.isdigit():
         return await cq.answer("Ошибка кнопки", show_alert=True)
     sale_id = int(part)
-
     async with Session() as s:
         sale = await s.get(Sale, sale_id)
         if not sale:
             return await cq.answer("Не найдено", show_alert=True)
 
-        # 1) вернуть товар на склад
-        stock = await get_stock_row(s, sale.warehouse_id, sale.product_id)
-        stock.qty_kg = Decimal(stock.qty_kg) + Decimal(sale.qty_kg)
-
-        # 2) если продажа была оплачена — удалить запись из денег
-        if sale.is_paid:
-            await s.execute(
-                delete(MoneyLedger).where(
-                    MoneyLedger.direction == "in",
-                    MoneyLedger.entry_date == sale.doc_date,
-                    MoneyLedger.amount == sale.total_amount,
-                    MoneyLedger.note.like(f"Продажа #{sale.id}%")
-                )
-            )
-
-        # 3) удалить продажу
         await s.execute(delete(Sale).where(Sale.id == sale_id))
         await s.commit()
 
-    await cq.message.answer(f"🗑 Продажа #{sale_id} удалена (остатки восстановлены).")
+    await cq.message.answer(f"🗑 Продажа #{sale_id} удалена.")
     await cq.answer()
-
 
 
 async def list_sales(message: Message):
@@ -1043,43 +1021,18 @@ def income_actions_kb(income_id: int):
 
 @router.callback_query(F.data.startswith("inc_del:"))
 async def cb_inc_del(cq: CallbackQuery):
-    part = cq.data.split(":", 1)[1]
+    part = cq.data.split(":", 1)[1] if cq.data else ""
     if not part.isdigit():
         return await cq.answer("Ошибка кнопки", show_alert=True)
     income_id = int(part)
-
     async with Session() as s:
         inc = await s.get(Income, income_id)
         if not inc:
             return await cq.answer("Не найдено", show_alert=True)
-
-        # 1) убрать товар со склада (и защититься от минуса)
-        stock = await get_stock_row(s, inc.warehouse_id, inc.product_id)
-        if Decimal(stock.qty_kg) < Decimal(inc.qty_kg):
-            return await cq.answer(
-                "Нельзя удалить: после удаления прихода остаток уйдёт в минус.",
-                show_alert=True
-            )
-        stock.qty_kg = Decimal(stock.qty_kg) - Decimal(inc.qty_kg)
-
-        # 2) если по приходу был расход денег — удалить запись
-        if inc.add_money_entry:
-            await s.execute(
-                delete(MoneyLedger).where(
-                    MoneyLedger.direction == "out",
-                    MoneyLedger.entry_date == inc.doc_date,
-                    MoneyLedger.amount == inc.total_amount,
-                    MoneyLedger.note.like(f"Приход #{inc.id}%")
-                )
-            )
-
-        # 3) удалить приход
         await s.execute(delete(Income).where(Income.id == income_id))
         await s.commit()
-
-    await cq.message.answer(f"🗑 Приход #{income_id} удалён (остатки пересчитаны).")
+    await cq.message.answer(f"🗑 Приход #{income_id} удалён.")
     await cq.answer()
-
 
 
 async def list_incomes(message: Message):
@@ -1155,7 +1108,10 @@ def debtor_actions_kb(debtor_id: int, paid: bool):
 
 @router.callback_query(F.data.startswith("deb_paid:"))
 async def cb_deb_paid(cq: CallbackQuery):
-    debtor_id = int(cq.data.split(":", 1)[1])
+    part = cq.data.split(":", 1)[1] if cq.data else ""
+    if not part.isdigit():
+        return await cq.answer("Ошибка кнопки", show_alert=True)
+    debtor_id = int(part)
     async with Session() as s:
         d = await s.get(Debtor, debtor_id)
         if not d:
@@ -1168,7 +1124,10 @@ async def cb_deb_paid(cq: CallbackQuery):
 
 @router.callback_query(F.data.startswith("deb_del:"))
 async def cb_deb_del(cq: CallbackQuery):
-    debtor_id = int(cq.data.split(":", 1)[1])
+    part = cq.data.split(":", 1)[1] if cq.data else ""
+    if not part.isdigit():
+        return await cq.answer("Ошибка кнопки", show_alert=True)
+    debtor_id = int(part)
     async with Session() as s:
         await s.execute(delete(Debtor).where(Debtor.id == debtor_id))
         await s.commit()
@@ -1321,7 +1280,11 @@ async def start_sale(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("cal:sale:"))
 async def cal_sale_handler(cq: CallbackQuery, state: FSMContext):
-    _, scope, action, payload = cq.data.split(":", 3)
+    # cal:sale:action:payload
+    parts = (cq.data or "").split(":", 3)
+    if len(parts) < 4:
+        return await cq.answer()
+    _, scope, action, payload = parts
 
     if action in ("open", "prev", "next"):
         y, m = payload.split("-")
@@ -1342,7 +1305,12 @@ async def cal_sale_handler(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("sale_nav:"))
 async def sale_nav_handler(cq: CallbackQuery, state: FSMContext):
-    _, field, action = cq.data.split(":", 2)
+    # sale_nav:field:action
+    parts = (cq.data or "").split(":", 2)
+    if len(parts) < 3:
+        return await cq.answer()
+    _, field, action = parts
+
     cur = await state.get_state()
     step = sale_state_name(cur)
 
@@ -1390,16 +1358,13 @@ async def sale_nav_handler(cq: CallbackQuery, state: FSMContext):
     await cq.answer()
 
 
-# ---- выбираем склад (и можно добавить прямо тут) ----
 @router.callback_query(F.data.startswith("sale_wh:"))
 async def sale_choose_wh(cq: CallbackQuery, state: FSMContext):
-    parts = (cq.data or "").split(":")
-    # ожидаемые варианты:
-    #   sale_wh:back
-    #   sale_wh:add_new
-    #   sale_wh:id:123
-    action = parts[1] if len(parts) > 1 else ""
-    rest = parts[2] if len(parts) > 2 else ""
+    parts = parse_cb(cq.data, "sale_wh")
+    if not parts:
+        return await cq.answer()
+
+    action = parts[0]
 
     if action == "back":
         await sale_go_to(state, "customer_phone")
@@ -1411,20 +1376,17 @@ async def sale_choose_wh(cq: CallbackQuery, state: FSMContext):
         await cq.message.answer("Напиши название нового склада:")
         return await cq.answer()
 
-    if action == "id":
-        if not rest.isdigit():
-            return await cq.answer("Ошибка склада", show_alert=True)
-        await state.update_data(warehouse_id=int(rest))
+    if action == "id" and len(parts) >= 2 and parts[1].isdigit():
+        await state.update_data(warehouse_id=int(parts[1]))
         await sale_go_to(state, "product_id")
         await sale_prompt(cq.message, state)
         return await cq.answer()
 
-    return await cq.answer()
+    return await cq.answer("Ошибка склада", show_alert=True)
 
 
 @router.message(SaleWizard.adding_warehouse)
 async def sale_add_warehouse_inline(message: Message, state: FSMContext):
-    # FIX: после добавления возвращаемся в шаг выбора склада через sale_go_to(..., "warehouse_id")
     name = safe_text(message.text)
     if not name:
         return await message.answer("Пусто. Напиши название склада:")
@@ -1439,16 +1401,13 @@ async def sale_add_warehouse_inline(message: Message, state: FSMContext):
     await message.answer("✅ Склад добавлен. Теперь выбери склад:", reply_markup=await pick_warehouse_kb("sale_wh"))
 
 
-# ---- выбираем товар (и можно добавить прямо тут) ----
 @router.callback_query(F.data.startswith("sale_pr:"))
 async def sale_choose_pr(cq: CallbackQuery, state: FSMContext):
-    parts = (cq.data or "").split(":")
-    # варианты:
-    #   sale_pr:back
-    #   sale_pr:add_new
-    #   sale_pr:id:123
-    action = parts[1] if len(parts) > 1 else ""
-    rest = parts[2] if len(parts) > 2 else ""
+    parts = parse_cb(cq.data, "sale_pr")
+    if not parts:
+        return await cq.answer()
+
+    action = parts[0]
 
     if action == "back":
         await sale_go_to(state, "warehouse_id")
@@ -1460,20 +1419,17 @@ async def sale_choose_pr(cq: CallbackQuery, state: FSMContext):
         await cq.message.answer("Напиши название нового товара:")
         return await cq.answer()
 
-    if action == "id":
-        if not rest.isdigit():
-            return await cq.answer("Ошибка товара", show_alert=True)
-        await state.update_data(product_id=int(rest))
+    if action == "id" and len(parts) >= 2 and parts[1].isdigit():
+        await state.update_data(product_id=int(parts[1]))
         await sale_go_to(state, "qty")
         await sale_prompt(cq.message, state)
         return await cq.answer()
 
-    return await cq.answer()
+    return await cq.answer("Ошибка товара", show_alert=True)
 
 
 @router.message(SaleWizard.adding_product)
 async def sale_add_product_inline(message: Message, state: FSMContext):
-    # FIX: после добавления возвращаемся в шаг выбора товара через sale_go_to(..., "product_id")
     name = safe_text(message.text)
     if not name:
         return await message.answer("Пусто. Напиши название товара:")
@@ -1548,7 +1504,7 @@ async def sale_delivery(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("sale_status:"))
 async def sale_status_chosen(cq: CallbackQuery, state: FSMContext):
-    status = cq.data.split(":", 1)[1]
+    status = cq.data.split(":", 1)[1] if cq.data else ""
     if status == "paid":
         await state.update_data(is_paid=True)
         await sale_go_to(state, "pay_method")
@@ -1562,7 +1518,7 @@ async def sale_status_chosen(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("sale_pay:"))
 async def sale_pay_method(cq: CallbackQuery, state: FSMContext):
-    method = cq.data.split(":", 1)[1]  # cash/noncash
+    method = cq.data.split(":", 1)[1] if cq.data else "cash"
     await state.update_data(payment_method=method)
     await sale_go_to(state, "account_type")
     await sale_prompt(cq.message, state)
@@ -1571,7 +1527,7 @@ async def sale_pay_method(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("sale_acc:"))
 async def sale_account_type_pick(cq: CallbackQuery, state: FSMContext):
-    acc = cq.data.split(":", 1)[1]  # cash/bank/ip
+    acc = cq.data.split(":", 1)[1] if cq.data else "cash"
     await state.update_data(account_type=acc)
 
     if acc == "cash":
@@ -1587,9 +1543,11 @@ async def sale_account_type_pick(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("sale_bank:"))
 async def sale_bank_pick(cq: CallbackQuery, state: FSMContext):
-    parts = (cq.data or "").split(":")
-    action = parts[1] if len(parts) > 1 else ""
-    rest = parts[2] if len(parts) > 2 else ""
+    parts = parse_cb(cq.data, "sale_bank")
+    if not parts:
+        return await cq.answer()
+
+    action = parts[0]
 
     if action == "back":
         await sale_go_to(state, "account_type")
@@ -1601,16 +1559,13 @@ async def sale_bank_pick(cq: CallbackQuery, state: FSMContext):
         await cq.message.answer("Напиши название нового банка (для Банка/ИП):")
         return await cq.answer()
 
-    if action == "id":
-        if not rest.isdigit():
-            return await cq.answer("Ошибка банка", show_alert=True)
-        await state.update_data(bank_id=int(rest))
+    if action == "id" and len(parts) >= 2 and parts[1].isdigit():
+        await state.update_data(bank_id=int(parts[1]))
         await sale_go_to(state, "confirm")
         await sale_prompt(cq.message, state)
         return await cq.answer()
 
-    return await cq.answer()
-
+    return await cq.answer("Ошибка банка", show_alert=True)
 
 
 @router.message(SaleWizard.adding_bank)
@@ -1666,11 +1621,9 @@ def build_sale_summary(data: dict) -> str:
     )
 
 
-from sqlalchemy import update  # добавь в импорты сверху рядом с select/delete/case
-
 @router.callback_query(F.data.startswith("sale_confirm:"))
 async def sale_confirm(cq: CallbackQuery, state: FSMContext):
-    ch = cq.data.split(":", 1)[1]
+    ch = cq.data.split(":", 1)[1] if cq.data else "no"
     if ch == "no":
         await state.clear()
         await cq.message.answer("Отменено ✅", reply_markup=main_menu_kb())
@@ -1698,18 +1651,13 @@ async def sale_confirm(cq: CallbackQuery, state: FSMContext):
     if account_type not in ("cash", "bank", "ip"):
         account_type = "cash"
 
-    if is_paid:
-        if account_type == "cash":
-            bank_id = None
-        else:
-            if not bank_id:
-                return await cq.answer("Выбери банк/счёт", show_alert=True)
-            bank_id = int(bank_id)
-    else:
-        # если не оплачено — деньги не трогаем
-        payment_method = ""
-        account_type = "cash"
+    if account_type == "cash":
         bank_id = None
+    else:
+        if not bank_id:
+            await cq.answer("Выбери банк/счёт", show_alert=True)
+            return
+        bank_id = int(bank_id)
 
     async with Session() as s:
         w = await s.get(Warehouse, warehouse_id)
@@ -1719,15 +1667,16 @@ async def sale_confirm(cq: CallbackQuery, state: FSMContext):
             await cq.message.answer("Ошибка: склад/товар не найден. Проверь справочники.", reply_markup=main_menu_kb())
             return await cq.answer()
 
-        if is_paid and account_type in ("bank", "ip"):
+        if account_type in ("bank", "ip"):
             b = await s.get(Bank, bank_id)
             if not b:
-                return await cq.answer("Банк не найден", show_alert=True)
+                await cq.answer("Банк не найден", show_alert=True)
+                return
 
-        # гарантируем, что строка Stock существует (если нет — создастся с 0)
+        # гарантируем строку остатков
         await get_stock_row(s, w.id, p.id)
 
-        # атомарно списываем: обновим только если остатков хватает
+        # ====== КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: запрет продажи в минус + атомарное списание ======
         res = await s.execute(
             update(Stock)
             .where(
@@ -1765,9 +1714,9 @@ async def sale_confirm(cq: CallbackQuery, state: FSMContext):
             total_amount=total,
             delivery_cost=delivery,
             is_paid=is_paid,
-            payment_method=payment_method,
-            account_type=account_type,
-            bank_id=bank_id
+            payment_method=payment_method if is_paid else "",
+            account_type=account_type if is_paid else "cash",
+            bank_id=bank_id if (is_paid and account_type in ("bank", "ip")) else None
         )
         s.add(sale)
         await s.flush()
@@ -1901,7 +1850,10 @@ async def start_income(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("cal:inc:"))
 async def cal_inc_handler(cq: CallbackQuery, state: FSMContext):
-    _, scope, action, payload = cq.data.split(":", 3)
+    parts = (cq.data or "").split(":", 3)
+    if len(parts) < 4:
+        return await cq.answer()
+    _, scope, action, payload = parts
 
     if action in ("open", "prev", "next"):
         y, m = payload.split("-")
@@ -1922,7 +1874,11 @@ async def cal_inc_handler(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("inc_nav:"))
 async def inc_nav_handler(cq: CallbackQuery, state: FSMContext):
-    _, field, action = cq.data.split(":", 2)
+    parts = (cq.data or "").split(":", 2)
+    if len(parts) < 3:
+        return await cq.answer()
+    _, field, action = parts
+
     cur = await state.get_state()
     step = income_state_name(cur)
 
@@ -1972,13 +1928,11 @@ async def inc_nav_handler(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("inc_wh:"))
 async def inc_choose_wh(cq: CallbackQuery, state: FSMContext):
-    parts = (cq.data or "").split(":")
-    # ожидаемые варианты:
-    #   inc_wh:back
-    #   inc_wh:add_new
-    #   inc_wh:id:123
-    action = parts[1] if len(parts) > 1 else ""
-    rest = parts[2] if len(parts) > 2 else ""
+    parts = parse_cb(cq.data, "inc_wh")
+    if not parts:
+        return await cq.answer()
+
+    action = parts[0]
 
     if action == "back":
         await income_go_to(state, "supplier_phone")
@@ -1990,20 +1944,17 @@ async def inc_choose_wh(cq: CallbackQuery, state: FSMContext):
         await cq.message.answer("Напиши название нового склада:")
         return await cq.answer()
 
-    if action == "id":
-        if not rest.isdigit():
-            return await cq.answer("Ошибка склада", show_alert=True)
-        await state.update_data(warehouse_id=int(rest))
+    if action == "id" and len(parts) >= 2 and parts[1].isdigit():
+        await state.update_data(warehouse_id=int(parts[1]))
         await income_go_to(state, "product_id")
         await income_prompt(cq.message, state)
         return await cq.answer()
 
-    return await cq.answer()
+    return await cq.answer("Ошибка склада", show_alert=True)
 
 
 @router.message(IncomeWizard.adding_warehouse)
 async def inc_add_warehouse_inline(message: Message, state: FSMContext):
-    # FIX: после добавления возвращаемся в шаг выбора склада через income_go_to(..., "warehouse_id")
     name = safe_text(message.text)
     if not name:
         return await message.answer("Пусто. Напиши название склада:")
@@ -2020,13 +1971,11 @@ async def inc_add_warehouse_inline(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("inc_pr:"))
 async def inc_choose_pr(cq: CallbackQuery, state: FSMContext):
-    parts = (cq.data or "").split(":")
-    # варианты:
-    #   inc_pr:back
-    #   inc_pr:add_new
-    #   inc_pr:id:123
-    action = parts[1] if len(parts) > 1 else ""
-    rest = parts[2] if len(parts) > 2 else ""
+    parts = parse_cb(cq.data, "inc_pr")
+    if not parts:
+        return await cq.answer()
+
+    action = parts[0]
 
     if action == "back":
         await income_go_to(state, "warehouse_id")
@@ -2038,21 +1987,17 @@ async def inc_choose_pr(cq: CallbackQuery, state: FSMContext):
         await cq.message.answer("Напиши название нового товара:")
         return await cq.answer()
 
-    if action == "id":
-        if not rest.isdigit():
-            return await cq.answer("Ошибка товара", show_alert=True)
-        await state.update_data(product_id=int(rest))
+    if action == "id" and len(parts) >= 2 and parts[1].isdigit():
+        await state.update_data(product_id=int(parts[1]))
         await income_go_to(state, "qty")
         await income_prompt(cq.message, state)
         return await cq.answer()
 
-    return await cq.answer()
-
+    return await cq.answer("Ошибка товара", show_alert=True)
 
 
 @router.message(IncomeWizard.adding_product)
 async def inc_add_product_inline(message: Message, state: FSMContext):
-    # FIX: после добавления возвращаемся в шаг выбора товара через income_go_to(..., "product_id")
     name = safe_text(message.text)
     if not name:
         return await message.answer("Пусто. Напиши название товара:")
@@ -2127,7 +2072,7 @@ async def inc_delivery(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("inc_money:"))
 async def inc_money_choice(cq: CallbackQuery, state: FSMContext):
-    ch = cq.data.split(":", 1)[1]
+    ch = cq.data.split(":", 1)[1] if cq.data else "no"
     if ch == "yes":
         await state.update_data(add_money_entry=True)
         await income_go_to(state, "pay_method")
@@ -2141,7 +2086,7 @@ async def inc_money_choice(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("inc_pay:"))
 async def inc_pay_choice(cq: CallbackQuery, state: FSMContext):
-    method = cq.data.split(":", 1)[1]
+    method = cq.data.split(":", 1)[1] if cq.data else "cash"
     await state.update_data(payment_method=method)
     await income_go_to(state, "account_type")
     await income_prompt(cq.message, state)
@@ -2150,7 +2095,7 @@ async def inc_pay_choice(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("inc_acc:"))
 async def inc_account_type_pick(cq: CallbackQuery, state: FSMContext):
-    acc = cq.data.split(":", 1)[1]
+    acc = cq.data.split(":", 1)[1] if cq.data else "cash"
     await state.update_data(account_type=acc)
 
     if acc == "cash":
@@ -2166,9 +2111,11 @@ async def inc_account_type_pick(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("inc_bank:"))
 async def inc_bank_pick(cq: CallbackQuery, state: FSMContext):
-    parts = (cq.data or "").split(":")
-    action = parts[1] if len(parts) > 1 else ""
-    rest = parts[2] if len(parts) > 2 else ""
+    parts = parse_cb(cq.data, "inc_bank")
+    if not parts:
+        return await cq.answer()
+
+    action = parts[0]
 
     if action == "back":
         await income_go_to(state, "account_type")
@@ -2180,15 +2127,13 @@ async def inc_bank_pick(cq: CallbackQuery, state: FSMContext):
         await cq.message.answer("Напиши название нового банка (для Банка/ИП):")
         return await cq.answer()
 
-    if action == "id":
-        if not rest.isdigit():
-            return await cq.answer("Ошибка банка", show_alert=True)
-        await state.update_data(bank_id=int(rest))
+    if action == "id" and len(parts) >= 2 and parts[1].isdigit():
+        await state.update_data(bank_id=int(parts[1]))
         await income_go_to(state, "confirm")
         await income_prompt(cq.message, state)
         return await cq.answer()
 
-    return await cq.answer()
+    return await cq.answer("Ошибка банка", show_alert=True)
 
 
 @router.message(IncomeWizard.adding_bank)
@@ -2245,7 +2190,7 @@ def build_income_summary(data: dict) -> str:
 
 @router.callback_query(F.data.startswith("inc_confirm:"))
 async def inc_confirm(cq: CallbackQuery, state: FSMContext):
-    ch = cq.data.split(":", 1)[1]
+    ch = cq.data.split(":", 1)[1] if cq.data else "no"
     if ch == "no":
         await state.clear()
         await cq.message.answer("Отменено ✅", reply_markup=main_menu_kb())
@@ -2269,8 +2214,10 @@ async def inc_confirm(cq: CallbackQuery, state: FSMContext):
 
     account_type = data.get("account_type", "cash")
     bank_id = data.get("bank_id")
+
     if account_type not in ("cash", "bank", "ip"):
         account_type = "cash"
+
     if account_type == "cash":
         bank_id = None
     else:
@@ -2341,7 +2288,10 @@ async def start_debtor(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("cal:deb:"))
 async def cal_deb_handler(cq: CallbackQuery, state: FSMContext):
-    _, scope, action, payload = cq.data.split(":", 3)
+    parts = (cq.data or "").split(":", 3)
+    if len(parts) < 4:
+        return await cq.answer()
+    _, scope, action, payload = parts
 
     if action in ("open", "prev", "next"):
         y, m = payload.split("-")
@@ -2360,7 +2310,10 @@ async def cal_deb_handler(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("deb_nav:"))
 async def deb_nav_handler(cq: CallbackQuery, state: FSMContext):
-    _, field, action = cq.data.split(":", 2)
+    parts = (cq.data or "").split(":", 2)
+    if len(parts) < 3:
+        return await cq.answer()
+    _, field, action = parts
 
     if action == "back":
         cur = await state.get_state()
@@ -2506,7 +2459,7 @@ def build_debtor_summary(data: dict) -> str:
 
 @router.callback_query(F.data.startswith("deb_confirm:"))
 async def deb_confirm(cq: CallbackQuery, state: FSMContext):
-    ch = cq.data.split(":", 1)[1]
+    ch = cq.data.split(":", 1)[1] if cq.data else "no"
     if ch == "no":
         await state.clear()
         await cq.message.answer("Отменено ✅", reply_markup=main_menu_kb())
@@ -2556,18 +2509,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
