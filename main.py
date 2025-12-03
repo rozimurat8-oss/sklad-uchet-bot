@@ -1393,7 +1393,13 @@ async def sale_add_warehouse_inline(message: Message, state: FSMContext):
 # ---- выбираем товар (и можно добавить прямо тут) ----
 @router.callback_query(F.data.startswith("sale_pr:"))
 async def sale_choose_pr(cq: CallbackQuery, state: FSMContext):
-    _, action, rest = cq.data.split(":", 2)
+    parts = (cq.data or "").split(":")
+    # варианты:
+    #   sale_pr:back
+    #   sale_pr:add_new
+    #   sale_pr:id:123
+    action = parts[1] if len(parts) > 1 else ""
+    rest = parts[2] if len(parts) > 2 else ""
 
     if action == "back":
         await sale_go_to(state, "warehouse_id")
@@ -1413,7 +1419,7 @@ async def sale_choose_pr(cq: CallbackQuery, state: FSMContext):
         await sale_prompt(cq.message, state)
         return await cq.answer()
 
-    await cq.answer()
+    return await cq.answer()
 
 
 @router.message(SaleWizard.adding_product)
@@ -1532,7 +1538,9 @@ async def sale_account_type_pick(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("sale_bank:"))
 async def sale_bank_pick(cq: CallbackQuery, state: FSMContext):
-    _, action, rest = cq.data.split(":", 2)
+    parts = (cq.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    rest = parts[2] if len(parts) > 2 else ""
 
     if action == "back":
         await sale_go_to(state, "account_type")
@@ -1552,7 +1560,8 @@ async def sale_bank_pick(cq: CallbackQuery, state: FSMContext):
         await sale_prompt(cq.message, state)
         return await cq.answer()
 
-    await cq.answer()
+    return await cq.answer()
+
 
 
 @router.message(SaleWizard.adding_bank)
@@ -1935,7 +1944,9 @@ async def inc_add_warehouse_inline(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("inc_pr:"))
 async def inc_choose_pr(cq: CallbackQuery, state: FSMContext):
-    _, action, rest = cq.data.split(":", 2)
+    parts = (cq.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    rest = parts[2] if len(parts) > 2 else ""
 
     if action == "back":
         await income_go_to(state, "warehouse_id")
@@ -1955,7 +1966,7 @@ async def inc_choose_pr(cq: CallbackQuery, state: FSMContext):
         await income_prompt(cq.message, state)
         return await cq.answer()
 
-    await cq.answer()
+    return await cq.answer()
 
 
 @router.message(IncomeWizard.adding_product)
@@ -2074,7 +2085,9 @@ async def inc_account_type_pick(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("inc_bank:"))
 async def inc_bank_pick(cq: CallbackQuery, state: FSMContext):
-    _, action, rest = cq.data.split(":", 2)
+    parts = (cq.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    rest = parts[2] if len(parts) > 2 else ""
 
     if action == "back":
         await income_go_to(state, "account_type")
@@ -2094,7 +2107,7 @@ async def inc_bank_pick(cq: CallbackQuery, state: FSMContext):
         await income_prompt(cq.message, state)
         return await cq.answer()
 
-    await cq.answer()
+    return await cq.answer()
 
 
 @router.message(IncomeWizard.adding_bank)
@@ -2462,4 +2475,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
