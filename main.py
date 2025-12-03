@@ -1791,9 +1791,9 @@ else:
 await s.commit()
 
 
-    await state.clear()
-    await cq.message.answer("✅ Продажа сохранена.", reply_markup=main_menu_kb())
-    await cq.answer()
+await state.clear()
+await cq.message.answer("✅ Продажа сохранена.", reply_markup=main_menu_kb())
+await cq.answer()
 
 
 # ===================== INCOME wizard =====================
@@ -2549,6 +2549,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
