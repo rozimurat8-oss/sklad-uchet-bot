@@ -18,7 +18,7 @@ from aiogram.enums.parse_mode import ParseMode
 
 from sqlalchemy import (
     String, Integer, Numeric, Date, DateTime, ForeignKey, Boolean,
-    select, func, delete, case, update, else_
+    select, func, delete, case, update
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -2727,3 +2727,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
