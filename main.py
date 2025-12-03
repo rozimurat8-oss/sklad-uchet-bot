@@ -129,7 +129,6 @@ class Sale(Base):
     is_paid: Mapped[bool] = mapped_column(Boolean, default=True)
     payment_method: Mapped[str] = mapped_column(String(10), default="")  # cash/noncash
 
-    # NEW:
     account_type: Mapped[str] = mapped_column(String(10), default="cash")  # cash/bank/ip
     bank_id: Mapped[int | None] = mapped_column(ForeignKey("banks.id"), nullable=True)
 
@@ -158,7 +157,6 @@ class Income(Base):
     add_money_entry: Mapped[bool] = mapped_column(Boolean, default=False)
     payment_method: Mapped[str] = mapped_column(String(10), default="")  # cash/noncash for expense
 
-    # NEW:
     account_type: Mapped[str] = mapped_column(String(10), default="cash")  # cash/bank/ip
     bank_id: Mapped[int | None] = mapped_column(ForeignKey("banks.id"), nullable=True)
 
@@ -819,7 +817,6 @@ async def show_stocks_table(message: Message):
 # ===================== Money =====================
 async def show_money(message: Message):
     async with Session() as s:
-        # balance = sum(in) - sum(out)
         rows = (await s.execute(
             select(
                 MoneyLedger.account_type,
@@ -908,8 +905,6 @@ async def cb_sale_paid_id(cq: CallbackQuery):
 
         sale.is_paid = True
 
-        # Если продажа была неоплачена — считаем, что при оплате деньги попали туда же,
-        # куда выбрали бы при оплате. Но если изначально нет данных — положим в cash.
         account_type = sale.account_type or "cash"
         bank_id = sale.bank_id if account_type in ("bank", "ip") else None
 
@@ -1185,8 +1180,10 @@ SALE_FLOW = [
     "qty", "price", "delivery", "paid_status", "pay_method", "account_type", "bank_pick", "confirm"
 ]
 
+
 def sale_state_name(state: State) -> str:
     return str(state).split(":")[-1]
+
 
 async def sale_go_to(state: FSMContext, step: str):
     mapping = {
@@ -1205,6 +1202,7 @@ async def sale_go_to(state: FSMContext, step: str):
         "confirm": SaleWizard.confirm,
     }
     await state.set_state(mapping[step])
+
 
 async def sale_prompt(message: Message, state: FSMContext):
     cur = await state.get_state()
@@ -1371,6 +1369,7 @@ async def sale_choose_wh(cq: CallbackQuery, state: FSMContext):
 
 @router.message(SaleWizard.adding_warehouse)
 async def sale_add_warehouse_inline(message: Message, state: FSMContext):
+    # FIX: после добавления возвращаемся в шаг выбора склада через sale_go_to(..., "warehouse_id")
     name = safe_text(message.text)
     if not name:
         return await message.answer("Пусто. Напиши название склада:")
@@ -1381,7 +1380,7 @@ async def sale_add_warehouse_inline(message: Message, state: FSMContext):
             s.add(Warehouse(name=name))
             await s.commit()
 
-    await state.set_state(SaleWizard.warehouse)
+    await sale_go_to(state, "warehouse_id")
     await message.answer("✅ Склад добавлен. Теперь выбери склад:", reply_markup=await pick_warehouse_kb("sale_wh"))
 
 
@@ -1413,6 +1412,7 @@ async def sale_choose_pr(cq: CallbackQuery, state: FSMContext):
 
 @router.message(SaleWizard.adding_product)
 async def sale_add_product_inline(message: Message, state: FSMContext):
+    # FIX: после добавления возвращаемся в шаг выбора товара через sale_go_to(..., "product_id")
     name = safe_text(message.text)
     if not name:
         return await message.answer("Пусто. Напиши название товара:")
@@ -1423,7 +1423,7 @@ async def sale_add_product_inline(message: Message, state: FSMContext):
             s.add(Product(name=name))
             await s.commit()
 
-    await state.set_state(SaleWizard.product)
+    await sale_go_to(state, "product_id")
     await message.answer("✅ Товар добавлен. Теперь выбери товар:", reply_markup=await pick_product_kb("sale_pr"))
 
 
@@ -1493,7 +1493,6 @@ async def sale_status_chosen(cq: CallbackQuery, state: FSMContext):
         await sale_go_to(state, "pay_method")
         await sale_prompt(cq.message, state)
     else:
-        # неоплачено -> сразу confirm
         await state.update_data(is_paid=False, payment_method="", account_type="cash", bank_id=None)
         await sale_go_to(state, "confirm")
         await sale_prompt(cq.message, state)
@@ -1504,9 +1503,6 @@ async def sale_status_chosen(cq: CallbackQuery, state: FSMContext):
 async def sale_pay_method(cq: CallbackQuery, state: FSMContext):
     method = cq.data.split(":", 1)[1]  # cash/noncash
     await state.update_data(payment_method=method)
-
-    # даже если method=cash, деньги могут пойти на "наличные" (логично)
-    # но мы всё равно дадим выбрать account_type (нал/банк/ип)
     await sale_go_to(state, "account_type")
     await sale_prompt(cq.message, state)
     await cq.answer()
@@ -1565,7 +1561,7 @@ async def sale_add_bank_inline(message: Message, state: FSMContext):
             s.add(Bank(name=name))
             await s.commit()
 
-    await state.set_state(SaleWizard.bank_pick)
+    await sale_go_to(state, "bank_pick")
     await message.answer("✅ Банк добавлен. Теперь выбери банк:", reply_markup=await pick_bank_kb("sale_bank"))
 
 
@@ -1722,8 +1718,10 @@ INCOME_FLOW = [
     "qty", "price", "delivery", "add_money", "pay_method", "account_type", "bank_pick", "confirm"
 ]
 
+
 def income_state_name(state: State) -> str:
     return str(state).split(":")[-1]
+
 
 async def income_go_to(state: FSMContext, step: str):
     mapping = {
@@ -1742,6 +1740,7 @@ async def income_go_to(state: FSMContext, step: str):
         "confirm": IncomeWizard.confirm,
     }
     await state.set_state(mapping[step])
+
 
 async def income_prompt(message: Message, state: FSMContext):
     cur = await state.get_state()
@@ -1907,6 +1906,7 @@ async def inc_choose_wh(cq: CallbackQuery, state: FSMContext):
 
 @router.message(IncomeWizard.adding_warehouse)
 async def inc_add_warehouse_inline(message: Message, state: FSMContext):
+    # FIX: после добавления возвращаемся в шаг выбора склада через income_go_to(..., "warehouse_id")
     name = safe_text(message.text)
     if not name:
         return await message.answer("Пусто. Напиши название склада:")
@@ -1917,7 +1917,7 @@ async def inc_add_warehouse_inline(message: Message, state: FSMContext):
             s.add(Warehouse(name=name))
             await s.commit()
 
-    await state.set_state(IncomeWizard.warehouse)
+    await income_go_to(state, "warehouse_id")
     await message.answer("✅ Склад добавлен. Теперь выбери склад:", reply_markup=await pick_warehouse_kb("inc_wh"))
 
 
@@ -1948,6 +1948,7 @@ async def inc_choose_pr(cq: CallbackQuery, state: FSMContext):
 
 @router.message(IncomeWizard.adding_product)
 async def inc_add_product_inline(message: Message, state: FSMContext):
+    # FIX: после добавления возвращаемся в шаг выбора товара через income_go_to(..., "product_id")
     name = safe_text(message.text)
     if not name:
         return await message.answer("Пусто. Напиши название товара:")
@@ -1958,7 +1959,7 @@ async def inc_add_product_inline(message: Message, state: FSMContext):
             s.add(Product(name=name))
             await s.commit()
 
-    await state.set_state(IncomeWizard.product)
+    await income_go_to(state, "product_id")
     await message.answer("✅ Товар добавлен. Теперь выбери товар:", reply_markup=await pick_product_kb("inc_pr"))
 
 
@@ -2096,7 +2097,7 @@ async def inc_add_bank_inline(message: Message, state: FSMContext):
             s.add(Bank(name=name))
             await s.commit()
 
-    await state.set_state(IncomeWizard.bank_pick)
+    await income_go_to(state, "bank_pick")
     await message.answer("✅ Банк добавлен. Теперь выбери банк:", reply_markup=await pick_bank_kb("inc_bank"))
 
 
