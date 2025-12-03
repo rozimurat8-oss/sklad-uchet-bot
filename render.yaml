@@ -1,0 +1,7 @@
+services:
+  - type: worker
+    name: sklad-uchet-bot
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
