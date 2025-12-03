@@ -18,7 +18,7 @@ from aiogram.enums.parse_mode import ParseMode
 
 from sqlalchemy import (
     String, Integer, Numeric, Date, DateTime, ForeignKey, Boolean,
-    select, func, delete, case, update
+    select, func, delete, case, update, else_
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -225,6 +225,10 @@ def main_menu_kb():
     kb.button(text="📄 Приходы")
     kb.button(text="📄 Продажи")
     kb.adjust(2)
+
+    # NEW
+    kb.button(text="📥 Выгрузка (таблица)")
+    kb.adjust(1)
 
     kb.button(text="📋 Должники")
     kb.button(text="➕ Добавить должн...")
@@ -447,7 +451,9 @@ router = Router()
 
 MENU_TEXTS = {
     "📦 Остатки", "💰 Деньги", "🟢 Приход", "🔴 Продажа",
-    "📄 Приходы", "📄 Продажи", "📋 Должники", "➕ Добавить должн...",
+    "📄 Приходы", "📄 Продажи",
+    "📥 Выгрузка (таблица)",  # NEW
+    "📋 Должники", "➕ Добавить должн...",
     "🏬 Склады", "🧺 Товары", "🏦 Банки",
     "❌ Отмена",
     "➕ Добавить склад", "📃 Список складов", "🗑 Удалить склад",
@@ -564,6 +570,11 @@ async def menu_anywhere(message: Message, state: FSMContext):
     if text == "📄 Приходы":
         await state.clear()
         return await list_incomes(message)
+
+    # NEW
+    if text == "📥 Выгрузка (таблица)":
+        await state.clear()
+        return await export_menu(message)
 
     if text == "📋 Должники":
         await state.clear()
@@ -872,6 +883,215 @@ async def show_money(message: Message):
         txt.append("• (пусто)")
 
     await message.answer("\n".join(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb())
+
+
+# ===================== EXPORT TABLES (CHAT) =====================
+EXPORT_PAGE_SIZE = 20  # безопасно для Telegram, можно менять
+
+
+def export_menu_kb():
+    ikb = InlineKeyboardBuilder()
+    ikb.button(text="📦 Остатки", callback_data="exp:stocks:0")
+    ikb.button(text="🟢 Приходы", callback_data="exp:incomes:0")
+    ikb.button(text="🔴 Продажи", callback_data="exp:sales:0")
+    ikb.button(text="⬅️ Назад", callback_data="exp:back")
+    ikb.adjust(2, 1, 1)
+    return ikb.as_markup()
+
+
+def export_pager_kb(kind: str, page: int, has_prev: bool, has_next: bool):
+    ikb = InlineKeyboardBuilder()
+    if has_prev:
+        ikb.button(text="⬅️ Назад", callback_data=f"exp:{kind}:{page-1}")
+    if has_next:
+        ikb.button(text="➡️ Далее", callback_data=f"exp:{kind}:{page+1}")
+    ikb.button(text="🏠 Меню выгрузки", callback_data="exp:menu")
+    ikb.adjust(2, 1)
+    return ikb.as_markup()
+
+
+async def export_menu(message: Message):
+    await message.answer("📥 Выгрузка таблиц (в чате):", reply_markup=export_menu_kb())
+
+
+def _render_pre_table(headers: list[str], rows: list[list[str]]) -> str:
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(cell))
+
+    line1 = " | ".join(headers[i].ljust(widths[i]) for i in range(len(headers)))
+    line2 = "-+-".join("-" * widths[i] for i in range(len(headers)))
+
+    body = []
+    for r in rows:
+        body.append(" | ".join(r[i].ljust(widths[i]) for i in range(len(headers))))
+
+    return "<pre>" + "\n".join([line1, line2] + body) + "</pre>"
+
+
+async def export_stocks_text(page: int):
+    async with Session() as s:
+        rows = (await s.execute(
+            select(Stock)
+            .options(selectinload(Stock.warehouse), selectinload(Stock.product))
+            .order_by(Stock.warehouse_id, Stock.product_id)
+        )).scalars().all()
+
+    data = []
+    for r in rows:
+        q = Decimal(r.qty_kg or 0)
+        if q == 0:
+            continue
+        data.append([r.warehouse.name, r.product.name, fmt_kg(q)])
+
+    if not data:
+        return "📦 Остатки: (везде 0)", None
+
+    total = len(data)
+    start = page * EXPORT_PAGE_SIZE
+    end = start + EXPORT_PAGE_SIZE
+    slice_rows = data[start:end]
+
+    has_prev = page > 0
+    has_next = end < total
+
+    txt = "📦 Остатки:\n" + _render_pre_table(
+        headers=["Склад", "Товар", "Остаток(кг)"],
+        rows=slice_rows
+    )
+    kb = export_pager_kb("stocks", page, has_prev, has_next)
+    return txt, kb
+
+
+async def export_incomes_text(page: int):
+    async with Session() as s:
+        rows = (await s.execute(
+            select(Income)
+            .options(selectinload(Income.warehouse), selectinload(Income.product))
+            .order_by(Income.id.desc())
+            .limit(50)
+        )).scalars().all()
+
+    if not rows:
+        return "🟢 Приходы: записей нет.", None
+
+    data = []
+    for r in rows:
+        data.append([
+            str(r.doc_date),
+            r.warehouse.name if r.warehouse else "-",
+            r.product.name if r.product else "-",
+            fmt_kg(Decimal(r.qty_kg or 0)),
+        ])
+
+    total = len(data)
+    start = page * EXPORT_PAGE_SIZE
+    end = start + EXPORT_PAGE_SIZE
+    slice_rows = data[start:end]
+
+    has_prev = page > 0
+    has_next = end < total
+
+    txt = "🟢 Приходы (последние 50):\n" + _render_pre_table(
+        headers=["Дата", "Склад", "Товар", "Кол-во(кг)"],
+        rows=slice_rows
+    )
+    kb = export_pager_kb("incomes", page, has_prev, has_next)
+    return txt, kb
+
+
+async def export_sales_text(page: int):
+    async with Session() as s:
+        rows = (await s.execute(
+            select(Sale)
+            .options(selectinload(Sale.warehouse), selectinload(Sale.product))
+            .order_by(Sale.id.desc())
+            .limit(50)
+        )).scalars().all()
+
+    if not rows:
+        return "🔴 Продажи: записей нет.", None
+
+    data = []
+    for r in rows:
+        who = safe_text(r.customer_name) or "-"
+        paid = "✅" if r.is_paid else "🧾"
+        data.append([
+            str(r.doc_date),
+            who,
+            r.warehouse.name if r.warehouse else "-",
+            r.product.name if r.product else "-",
+            fmt_kg(Decimal(r.qty_kg or 0)),
+            fmt_money(Decimal(r.price_per_kg or 0)),
+            fmt_money(Decimal(r.total_amount or 0)),
+            paid
+        ])
+
+    total = len(data)
+    start = page * EXPORT_PAGE_SIZE
+    end = start + EXPORT_PAGE_SIZE
+    slice_rows = data[start:end]
+
+    has_prev = page > 0
+    has_next = end < total
+
+    txt = "🔴 Продажи (последние 50):\n" + _render_pre_table(
+        headers=["Дата", "Кому", "Склад", "Товар", "Кол-во(кг)", "Цена/кг", "Сумма", "Опл"],
+        rows=slice_rows
+    )
+    kb = export_pager_kb("sales", page, has_prev, has_next)
+    return txt, kb
+
+
+@router.callback_query(F.data.startswith("exp:"))
+async def export_router(cq: CallbackQuery):
+    """
+    exp:menu
+    exp:back
+    exp:stocks:0
+    exp:incomes:1
+    exp:sales:2
+    """
+    parts = (cq.data or "").split(":")
+    if len(parts) < 2:
+        return await cq.answer()
+
+    action = parts[1]
+
+    if action == "menu":
+        await cq.message.answer("📥 Выгрузка таблиц (в чате):", reply_markup=export_menu_kb())
+        return await cq.answer()
+
+    if action == "back":
+        await cq.message.answer("Меню:", reply_markup=main_menu_kb())
+        return await cq.answer()
+
+    if len(parts) != 3:
+        return await cq.answer("Ошибка кнопки", show_alert=True)
+
+    kind = parts[1]
+    page_s = parts[2]
+    if not page_s.isdigit():
+        return await cq.answer("Ошибка страницы", show_alert=True)
+    page = int(page_s)
+
+    if kind == "stocks":
+        txt, kb = await export_stocks_text(page)
+        await cq.message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return await cq.answer()
+
+    if kind == "incomes":
+        txt, kb = await export_incomes_text(page)
+        await cq.message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return await cq.answer()
+
+    if kind == "sales":
+        txt, kb = await export_sales_text(page)
+        await cq.message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return await cq.answer()
+
+    return await cq.answer("Неизвестный раздел", show_alert=True)
 
 
 # ===================== Lists (Sales/Incomes/Debtors) =====================
@@ -1673,10 +1893,8 @@ async def sale_confirm(cq: CallbackQuery, state: FSMContext):
                 await cq.answer("Банк не найден", show_alert=True)
                 return
 
-        # гарантируем строку остатков
         await get_stock_row(s, w.id, p.id)
 
-        # ====== КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: запрет продажи в минус + атомарное списание ======
         res = await s.execute(
             update(Stock)
             .where(
