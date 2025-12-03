@@ -1344,7 +1344,13 @@ async def sale_nav_handler(cq: CallbackQuery, state: FSMContext):
 # ---- выбираем склад (и можно добавить прямо тут) ----
 @router.callback_query(F.data.startswith("sale_wh:"))
 async def sale_choose_wh(cq: CallbackQuery, state: FSMContext):
-    _, action, rest = cq.data.split(":", 2)
+    parts = (cq.data or "").split(":")
+    # ожидаемые варианты:
+    #   sale_wh:back
+    #   sale_wh:add_new
+    #   sale_wh:id:123
+    action = parts[1] if len(parts) > 1 else ""
+    rest = parts[2] if len(parts) > 2 else ""
 
     if action == "back":
         await sale_go_to(state, "customer_phone")
@@ -1364,7 +1370,7 @@ async def sale_choose_wh(cq: CallbackQuery, state: FSMContext):
         await sale_prompt(cq.message, state)
         return await cq.answer()
 
-    await cq.answer()
+    return await cq.answer()
 
 
 @router.message(SaleWizard.adding_warehouse)
@@ -1881,7 +1887,13 @@ async def inc_nav_handler(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("inc_wh:"))
 async def inc_choose_wh(cq: CallbackQuery, state: FSMContext):
-    _, action, rest = cq.data.split(":", 2)
+    parts = (cq.data or "").split(":")
+    # ожидаемые варианты:
+    #   inc_wh:back
+    #   inc_wh:add_new
+    #   inc_wh:id:123
+    action = parts[1] if len(parts) > 1 else ""
+    rest = parts[2] if len(parts) > 2 else ""
 
     if action == "back":
         await income_go_to(state, "supplier_phone")
@@ -1901,7 +1913,7 @@ async def inc_choose_wh(cq: CallbackQuery, state: FSMContext):
         await income_prompt(cq.message, state)
         return await cq.answer()
 
-    await cq.answer()
+    return await cq.answer()
 
 
 @router.message(IncomeWizard.adding_warehouse)
@@ -2450,3 +2462,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
