@@ -1720,7 +1720,7 @@ async def sale_confirm(cq: CallbackQuery, state: FSMContext):
             await get_stock_row(s, w.id, p.id)
 
 # атомарно списываем, только если хватает остатка
-res = await s.execute(
+    res = await s.execute(
     update(Stock)
     .where(
         Stock.warehouse_id == w.id,
@@ -2549,6 +2549,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
