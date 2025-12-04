@@ -34,7 +34,7 @@ DB_URL = os.getenv("DB_URL", "sqlite+aiosqlite:////var/data/data.db")
 engine = create_async_engine(DB_URL, echo=False)
 Session = async_sessionmaker(engine, expire_on_commit=False)
 
-OWNER_ID = int(os.getenv("OWNER_ID", "139099579") or 0)  # fixed default owner id
+OWNER_ID = int(os.getenv("OWNER_ID", "139099578") or 0)  # fixed default owner id
 
 print("=== BOOT ===", flush=True)
 print("TOKEN set:", bool(TOKEN), flush=True)
@@ -3132,4 +3132,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
