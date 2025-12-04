@@ -1675,6 +1675,170 @@ async def show_reports_menu(message: Message, state: FSMContext):
 
 
 @router.message(F.text.in_(MAIN_BTNS | REPORTS_BTNS | WH_BTNS | PR_BTNS | BK_BTNS))
+
+# --- Restored functions (income wizard + reports lists) ---
+
+async def income_go_to(state: FSMContext, step: str):
+    mapping = {
+        "doc_date": IncomeWizard.doc_date,
+        "supplier_name": IncomeWizard.supplier_name,
+        "supplier_phone": IncomeWizard.supplier_phone,
+        "warehouse_id": IncomeWizard.warehouse,
+        "product_id": IncomeWizard.product,
+        "qty": IncomeWizard.qty,
+        "price": IncomeWizard.price,
+        "delivery": IncomeWizard.delivery,
+        "add_money": IncomeWizard.add_money,
+        "pay_method": IncomeWizard.pay_method,
+        "account_type": IncomeWizard.account_type,
+        "bank_pick": IncomeWizard.bank_pick,
+        "confirm": IncomeWizard.confirm,
+    }
+    await state.set_state(mapping[step])
+
+async def income_prompt(message: Message, state: FSMContext):
+    cur = await state.get_state()
+    step = income_state_name(cur)
+
+    if step == "doc_date":
+        await message.answer("Дата прихода:", reply_markup=choose_date_kb("inc"))
+        return
+    if step == "supplier_name":
+        await message.answer("Имя поставщика:", reply_markup=nav_kb("inc_nav:supplier_name", allow_skip=True))
+        return
+    if step == "supplier_phone":
+        await message.answer("Телефон поставщика:", reply_markup=nav_kb("inc_nav:supplier_phone", allow_skip=True))
+        return
+    if step == "warehouse":
+        await message.answer("Выбери склад прихода:", reply_markup=await pick_warehouse_kb("inc_wh"))
+        return
+    if step == "product":
+        await message.answer("Выбери товар:", reply_markup=await pick_product_kb("inc_pr"))
+        return
+    if step == "qty":
+        await message.answer("Кол-во (кг):", reply_markup=nav_kb("inc_nav:qty", allow_skip=False))
+        return
+    if step == "price":
+        await message.answer("Цена за 1 кг:", reply_markup=nav_kb("inc_nav:price", allow_skip=False))
+        return
+    if step == "delivery":
+        await message.answer("Доставка (0 если нет):", reply_markup=nav_kb("inc_nav:delivery", allow_skip=True))
+        return
+    if step == "add_money":
+        await message.answer("Добавить запись денег (расход) по этому приходу?", reply_markup=yes_no_kb("inc_money"))
+        return
+    if step == "pay_method":
+        await message.answer("Как оплатили поставщику?", reply_markup=pay_method_kb("inc_pay"))
+        return
+    if step == "account_type":
+        await message.answer("С какого счёта ушли деньги?", reply_markup=account_type_kb("inc_acc"))
+        return
+    if step == "bank_pick":
+        await message.answer("Выбери банк/счёт из списка:", reply_markup=await pick_bank_kb("inc_bank"))
+        return
+    if step == "confirm":
+        data = await state.get_data()
+        await message.answer(build_income_summary(data) + "\n\nПодтвердить?",
+                             parse_mode=ParseMode.HTML,
+                             reply_markup=yes_no_kb("inc_confirm"))
+        return
+
+async def start_income(message: Message, state: FSMContext, is_admin: bool):
+    await state.clear()
+    await set_menu(state, "main")
+    await income_go_to(state, "doc_date")
+    await income_prompt(message, state)
+
+async def list_sales(message: Message, state: FSMContext):
+    async with Session() as s:
+        rows = (await s.execute(
+            select(Sale)
+            .options(selectinload(Sale.warehouse), selectinload(Sale.product), selectinload(Sale.bank))
+            .order_by(Sale.id.desc())
+            .limit(30)
+        )).scalars().all()
+
+    if not rows:
+        return await reply_in_menu(message, state, "Продаж пока нет.")
+
+    data = []
+    for r in rows:
+        wh = r.warehouse.name if r.warehouse else "-"
+        pr = r.product.name if r.product else "-"
+        paid = "ДА" if r.is_paid else "НЕТ"
+        data.append((
+            str(r.id),
+            r.doc_date.strftime("%d.%m"),
+            (r.customer_name or "-")[:14],
+            wh[:10],
+            pr[:14],
+            fmt_kg(Decimal(r.qty_kg)),
+            fmt_money(Decimal(r.total_amount)),
+            paid
+        ))
+
+    headers = ("ID", "Дата", "Клиент", "Склад", "Товар", "кг", "Сумма", "Опл")
+    widths = [len(h) for h in headers]
+    for row in data:
+        for i, v in enumerate(row):
+            widths[i] = max(widths[i], len(v))
+
+    lines = []
+    lines.append(" | ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
+    lines.append("-+-".join("-" * widths[i] for i in range(len(headers))))
+    for row in data:
+        lines.append(" | ".join(row[i].ljust(widths[i]) for i in range(len(headers))))
+
+    txt = "📄 <b>Последние продажи</b> (30):\n<pre>" + "\n".join(lines) + "</pre>"
+    await message.answer(txt, parse_mode=ParseMode.HTML)
+
+
+
+async def list_incomes(message: Message, state: FSMContext):
+    async with Session() as s:
+        rows = (await s.execute(
+            select(Income)
+            .options(selectinload(Income.warehouse), selectinload(Income.product), selectinload(Income.bank))
+            .order_by(Income.id.desc())
+            .limit(30)
+        )).scalars().all()
+
+    if not rows:
+        return await reply_in_menu(message, state, "Приходов пока нет.")
+
+    data = []
+    for r in rows:
+        wh = r.warehouse.name if r.warehouse else "-"
+        pr = r.product.name if r.product else "-"
+        paid = "ДА" if r.add_money_entry else "НЕТ"
+        data.append((
+            str(r.id),
+            r.doc_date.strftime("%d.%m"),
+            (r.supplier_name or "-")[:14],
+            wh[:10],
+            pr[:14],
+            fmt_kg(Decimal(r.qty_kg)),
+            fmt_money(Decimal(r.total_amount)),
+            paid
+        ))
+
+    headers = ("ID", "Дата", "Поставщик", "Склад", "Товар", "кг", "Сумма", "Опл")
+    widths = [len(h) for h in headers]
+    for row in data:
+        for i, v in enumerate(row):
+            widths[i] = max(widths[i], len(v))
+
+    lines = []
+    lines.append(" | ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
+    lines.append("-+-".join("-" * widths[i] for i in range(len(headers))))
+    for row in data:
+        lines.append(" | ".join(row[i].ljust(widths[i]) for i in range(len(headers))))
+
+    txt = "📄 <b>Последние приходы</b> (30):\n<pre>" + "\n".join(lines) + "</pre>"
+    await message.answer(txt, parse_mode=ParseMode.HTML)
+
+
+
 async def menu_router(message: Message, state: FSMContext):
     uid = message.from_user.id
     await upsert_user_from_tg(message.from_user)
