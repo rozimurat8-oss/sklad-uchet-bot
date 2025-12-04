@@ -18,7 +18,7 @@ from aiogram.enums.parse_mode import ParseMode
 
 from sqlalchemy import (
     String, Integer, Numeric, Date, DateTime, ForeignKey, Boolean,
-    select, func, delete, case, update, UniqueConstraint
+    select, func, delete, case, update
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -32,10 +32,12 @@ if not TOKEN:
 
 DB_URL = os.getenv("DB_URL", "sqlite+aiosqlite:////var/data/data.db")
 
-# ВНИМАНИЕ: твой ID (OWNER). Только ты можешь выдавать/забирать доступ.
-# Ты написал: 39099578 (и ранее 139099579). Я ставлю 39099578 как актуальный.
-# Если нужен 139099579 — просто замени ниже.
-OWNER_ID = int(os.getenv("OWNER_ID", "39099578"))
+ADMIN_USER_IDS = set(
+    int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",")
+
+OWNER_ID = int(os.getenv("OWNER_ID", "39099578") or 0)
+    if x.strip().isdigit()
+)
 
 print("=== BOOT ===", flush=True)
 print("TOKEN set:", bool(TOKEN), flush=True)
@@ -46,15 +48,6 @@ print("OWNER_ID:", OWNER_ID, flush=True)
 # ===================== DB models =====================
 class Base(DeclarativeBase):
     pass
-
-
-class AllowedUser(Base):
-    __tablename__ = "allowed_users"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
-    added_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
-    added_by: Mapped[int] = mapped_column(Integer, default=0)  # кто выдал доступ
-    note: Mapped[str] = mapped_column(String(200), default="")  # например username/имя
 
 
 class Warehouse(Base):
@@ -77,8 +70,6 @@ class Bank(Base):
 
 class Stock(Base):
     __tablename__ = "stocks"
-    __table_args__ = (UniqueConstraint("warehouse_id", "product_id", name="uq_stock_wh_pr"),)
-
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     warehouse_id: Mapped[int] = mapped_column(ForeignKey("warehouses.id"), index=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
@@ -181,68 +172,58 @@ class Debtor(Base):
     is_paid: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class AllowedUser(Base):
+    __tablename__ = "allowed_users"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    added_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    added_by: Mapped[int] = mapped_column(Integer, default=0)
+    note: Mapped[str] = mapped_column(String(300), default="")
+
+
+
+# ===================== Light migrations (SQLite) =====================
+async def ensure_allowed_users_schema(conn):
+    # Create table if not exists
+    await conn.exec_driver_sql(
+        """
+        CREATE TABLE IF NOT EXISTS allowed_users (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL UNIQUE,
+            added_at DATETIME,
+            added_by INTEGER,
+            note VARCHAR(300)
+        )
+        """
+    )
+
+    # Add missing columns (older DB may have only id/user_id)
+    cols = [row[1] for row in (await conn.exec_driver_sql("PRAGMA table_info(allowed_users)")).fetchall()]
+    if "added_at" not in cols:
+        await conn.exec_driver_sql("ALTER TABLE allowed_users ADD COLUMN added_at DATETIME")
+    if "added_by" not in cols:
+        await conn.exec_driver_sql("ALTER TABLE allowed_users ADD COLUMN added_by INTEGER")
+    if "note" not in cols:
+        await conn.exec_driver_sql("ALTER TABLE allowed_users ADD COLUMN note VARCHAR(300)")
+
 engine = create_async_engine(DB_URL, echo=False)
 Session = async_sessionmaker(engine, expire_on_commit=False)
 
 
-# ===================== Access control =====================
-def is_owner(user_id: int) -> bool:
+# ===================== Helpers =====================
+def is_admin(user_id: int) -> bool:
+    # Owner always allowed. Others must be in AllowedUser.
     return int(user_id) == int(OWNER_ID)
 
 
 async def is_allowed(user_id: int) -> bool:
-    if is_owner(user_id):
+    if int(user_id) == int(OWNER_ID):
         return True
     async with Session() as s:
-        au = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == int(user_id)))
-        return bool(au)
+        return bool(await s.scalar(select(AllowedUser.id).where(AllowedUser.user_id == int(user_id))))
 
 
-def access_request_kb():
-    ikb = InlineKeyboardBuilder()
-    ikb.button(text="✅ Запросить доступ", callback_data="access:req")
-    ikb.adjust(1)
-    return ikb.as_markup()
 
-
-def owner_access_decision_kb(user_id: int):
-    ikb = InlineKeyboardBuilder()
-    ikb.button(text="✅ Разрешить", callback_data=f"access:allow:{user_id}")
-    ikb.button(text="❌ Отклонить", callback_data=f"access:deny:{user_id}")
-    ikb.adjust(2)
-    return ikb.as_markup()
-
-
-def user_revoke_kb(user_id: int):
-    ikb = InlineKeyboardBuilder()
-    ikb.button(text="🗑 Удалить доступ", callback_data=f"access:revoke:{user_id}")
-    ikb.adjust(1)
-    return ikb.as_markup()
-
-
-async def guard_message(message: Message) -> bool:
-    uid = message.from_user.id
-    if await is_allowed(uid):
-        return True
-    await message.answer(
-        "⛔ Нет доступа.\nНажми кнопку ниже, чтобы запросить доступ у администратора.",
-        reply_markup=access_request_kb()
-    )
-    return False
-
-
-async def guard_callback(cq: CallbackQuery) -> bool:
-    uid = cq.from_user.id
-    # callbacks для доступа должны работать даже без доступа
-    if (cq.data or "").startswith("access:"):
-        return True
-    if await is_allowed(uid):
-        return True
-    await cq.answer("Нет доступа", show_alert=True)
-    return False
-
-
-# ===================== Helpers =====================
 def dec(s: str) -> Decimal:
     s = (s or "").strip().replace(",", ".")
     return Decimal(s)
@@ -272,21 +253,12 @@ def parse_cb(data: str, prefix: str):
     """
     if not data or not data.startswith(prefix + ":"):
         return []
-    rest = data[len(prefix) + 1:]
+    rest = data[len(prefix) + 1 :]
     return rest.split(":") if rest else []
 
 
-def user_label(u) -> str:
-    # u: aiogram User
-    if not u:
-        return "-"
-    uname = f"@{u.username}" if getattr(u, "username", None) else ""
-    full = " ".join([x for x in [getattr(u, "first_name", "") or "", getattr(u, "last_name", "") or ""] if x]).strip()
-    return f"{full} {uname}".strip() or uname or str(getattr(u, "id", ""))
-
-
 # ===================== Menus =====================
-def main_menu_kb(is_owner_flag: bool = False):
+def main_menu_kb():
     kb = ReplyKeyboardBuilder()
     kb.button(text="📦 Остатки")
     kb.button(text="💰 Деньги")
@@ -300,6 +272,10 @@ def main_menu_kb(is_owner_flag: bool = False):
     kb.button(text="📄 Продажи")
     kb.adjust(2)
 
+    # NEW
+    kb.button(text="📥 Выгрузка (таблица)")
+    kb.adjust(1)
+
     kb.button(text="📋 Должники")
     kb.button(text="➕ Добавить должн...")
     kb.adjust(2)
@@ -310,10 +286,6 @@ def main_menu_kb(is_owner_flag: bool = False):
 
     kb.button(text="🏦 Банки")
     kb.adjust(1)
-
-    if is_owner_flag:
-        kb.button(text="👥 Пользователи")
-        kb.adjust(1)
 
     kb.button(text="❌ Отмена")
     kb.adjust(1)
@@ -525,9 +497,10 @@ router = Router()
 
 MENU_TEXTS = {
     "📦 Остатки", "💰 Деньги", "🟢 Приход", "🔴 Продажа",
-    "📄 Приходы", "📄 Продажи", "📋 Должники", "➕ Добавить должн...",
+    "📄 Приходы", "📄 Продажи",
+    "📥 Выгрузка (таблица)",  # NEW
+    "📋 Должники", "➕ Добавить должн...",
     "🏬 Склады", "🧺 Товары", "🏦 Банки",
-    "👥 Пользователи",
     "❌ Отмена",
     "➕ Добавить склад", "📃 Список складов", "🗑 Удалить склад",
     "➕ Добавить товар", "📃 Список товаров", "🗑 Удалить товар",
@@ -604,144 +577,21 @@ async def pick_bank_kb(prefix: str):
     return ikb.as_markup()
 
 
-# ===================== Access flow callbacks =====================
-@router.callback_query(F.data == "access:req")
-async def cb_access_request(cq: CallbackQuery):
-    # может нажать любой (даже без доступа)
-    u = cq.from_user
-    uid = u.id
-    # если уже есть доступ
-    if await is_allowed(uid):
-        await cq.answer("У вас уже есть доступ ✅", show_alert=True)
-        return
-
-    text = (
-        "🔔 *Запрос доступа*\n"
-        f"Пользователь: *{user_label(u)}*\n"
-        f"ID: `{uid}`"
-    )
-
-    # отправляем owner-у
-    try:
-        await cq.bot.send_message(
-            chat_id=OWNER_ID,
-            text=text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=owner_access_decision_kb(uid)
-        )
-    except Exception:
-        # если юзер жмёт не в ЛС или у бота нет доступа к owner чат — ответим мягко
-        await cq.answer("Не удалось отправить запрос админу. Проверь, что ты (админ) запускал бота и тебе можно писать.", show_alert=True)
-        return
-
-    await cq.answer("Запрос отправлен админу ✅", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("access:allow:"))
-async def cb_access_allow(cq: CallbackQuery):
-    if cq.from_user.id != OWNER_ID:
-        return await cq.answer("Только владелец может выдавать доступ", show_alert=True)
-
-    parts = (cq.data or "").split(":")
-    if len(parts) != 3 or not parts[2].isdigit():
-        return await cq.answer("Ошибка кнопки", show_alert=True)
-    uid = int(parts[2])
-
-    async with Session() as s:
-        exists = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == uid))
-        if not exists:
-            s.add(AllowedUser(user_id=uid, added_by=OWNER_ID, note=""))
-            await s.commit()
-
-    # уведомим пользователя
-    try:
-        await cq.bot.send_message(uid, "✅ Доступ выдан. Напиши /start")
-    except Exception:
-        pass
-
-    await cq.message.edit_text((cq.message.text or "") + "\n\n✅ *Доступ выдан*", parse_mode=ParseMode.MARKDOWN)
-    await cq.answer("Готово ✅")
-
-
-@router.callback_query(F.data.startswith("access:deny:"))
-async def cb_access_deny(cq: CallbackQuery):
-    if cq.from_user.id != OWNER_ID:
-        return await cq.answer("Только владелец может отклонять", show_alert=True)
-
-    parts = (cq.data or "").split(":")
-    if len(parts) != 3 or not parts[2].isdigit():
-        return await cq.answer("Ошибка кнопки", show_alert=True)
-    uid = int(parts[2])
-
-    try:
-        await cq.bot.send_message(uid, "❌ Доступ не выдан. Если нужно — попроси админа ещё раз.")
-    except Exception:
-        pass
-
-    await cq.message.edit_text((cq.message.text or "") + "\n\n❌ *Отклонено*", parse_mode=ParseMode.MARKDOWN)
-    await cq.answer("Отклонено")
-
-
-@router.callback_query(F.data.startswith("access:revoke:"))
-async def cb_access_revoke(cq: CallbackQuery):
-    if cq.from_user.id != OWNER_ID:
-        return await cq.answer("Только владелец может удалять доступ", show_alert=True)
-
-    parts = (cq.data or "").split(":")
-    if len(parts) != 3 or not parts[2].isdigit():
-        return await cq.answer("Ошибка кнопки", show_alert=True)
-    uid = int(parts[2])
-
-    async with Session() as s:
-        await s.execute(delete(AllowedUser).where(AllowedUser.user_id == uid))
-        await s.commit()
-
-    try:
-        await cq.bot.send_message(uid, "⛔ Доступ отозван.")
-    except Exception:
-        pass
-
-    await cq.message.answer(f"🗑 Доступ для `{uid}` удалён.", parse_mode=ParseMode.MARKDOWN)
-    await cq.answer("Удалено")
-
-
-# ===================== Users admin view =====================
-async def show_users(message: Message):
-    if message.from_user.id != OWNER_ID:
-        return await message.answer("Нет доступа.")
-
-    async with Session() as s:
-        rows = (await s.execute(select(AllowedUser).order_by(AllowedUser.added_at.desc()))).scalars().all()
-
-    if not rows:
-        return await message.answer("Пользователей пока нет (кроме тебя).", reply_markup=main_menu_kb(is_owner_flag=True))
-
-    lines = ["👥 *Пользователи с доступом:*"]
-    for r in rows[:60]:
-        lines.append(f"• `{r.user_id}` (добавлен: {r.added_at.strftime('%Y-%m-%d %H:%M')})")
-
-    await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb(is_owner_flag=True))
-
-    # покажем кнопки удаления отдельными сообщениями (чтобы не превышать лимиты клавиатуры)
-    for r in rows[:30]:
-        await message.answer(f"ID: `{r.user_id}`", parse_mode=ParseMode.MARKDOWN, reply_markup=user_revoke_kb(r.user_id))
-
-
 # ===================== Menu handler =====================
 @router.message(F.text.in_(MENU_TEXTS))
 async def menu_anywhere(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
+    if not (await is_allowed(message.from_user.id)):
+        return await message.answer("Нет доступа.")
 
     text = message.text
 
     if text == "❌ Отмена":
         await state.clear()
-        return await message.answer("Ок, отменил ✅", reply_markup=main_menu_kb(is_owner_flag=is_owner(message.from_user.id)))
+        return await message.answer("Ок, отменил ✅", reply_markup=main_menu_kb())
 
     if text == "⬅️ Назад в меню":
         await state.clear()
-        return await message.answer("Меню:", reply_markup=main_menu_kb(is_owner_flag=is_owner(message.from_user.id)))
+        return await message.answer("Меню:", reply_markup=main_menu_kb())
 
     if text == "📦 Остатки":
         await state.clear()
@@ -767,6 +617,11 @@ async def menu_anywhere(message: Message, state: FSMContext):
         await state.clear()
         return await list_incomes(message)
 
+    # NEW
+    if text == "📥 Выгрузка (таблица)":
+        await state.clear()
+        return await export_menu(message)
+
     if text == "📋 Должники":
         await state.clear()
         return await list_debtors(message)
@@ -786,10 +641,6 @@ async def menu_anywhere(message: Message, state: FSMContext):
     if text == "🏦 Банки":
         await state.clear()
         return await message.answer("Управление банками:", reply_markup=banks_menu_kb())
-
-    if text == "👥 Пользователи":
-        await state.clear()
-        return await show_users(message)
 
     # warehouses admin actions
     if text == "➕ Добавить склад":
@@ -839,40 +690,78 @@ async def menu_anywhere(message: Message, state: FSMContext):
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
-    # /start должен работать для всех, но меню покажем только доступным
-    if not await is_allowed(message.from_user.id):
-        await state.clear()
-        return await message.answer(
-            "Привет! ⛔ Сейчас у тебя нет доступа.\nНажми кнопку ниже, чтобы запросить доступ у администратора.",
-            reply_markup=access_request_kb()
-        )
-
     await state.clear()
-    await message.answer(
-        "Привет! Выбери действие:",
-        reply_markup=main_menu_kb(is_owner_flag=is_owner(message.from_user.id))
-    )
 
+    uid = message.from_user.id
+    if await is_allowed(uid):
+        return await message.answer("Привет! Выбери действие:", reply_markup=main_menu_kb())
 
-# На любые другие сообщения без доступа — показываем кнопку запроса
-@router.message()
-async def fallback_all(message: Message, state: FSMContext):
-    # если это уже обработано другими хендлерами — до сюда обычно не дойдёт
-    if not await is_allowed(message.from_user.id):
-        await state.clear()
-        return await message.answer(
-            "⛔ Нет доступа.\nНажми кнопку ниже, чтобы запросить доступ.",
-            reply_markup=access_request_kb()
+    # запрос доступа владельцу
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Разрешить", callback_data=f"acc_req:allow:{uid}")
+    kb.button(text="❌ Запретить", callback_data=f"acc_req:deny:{uid}")
+    kb.adjust(2)
+
+    await message.answer("⛔ У вас нет доступа. Запрос отправлен владельцу.")
+    try:
+        await message.bot.send_message(
+            OWNER_ID,
+            f"🔐 Запрос доступа к боту
+"
+            f"ID: {uid}
+"
+            f"Имя: {safe_text(message.from_user.full_name)}
+"
+            f"Юзернейм: @{message.from_user.username}" if message.from_user.username else f"🔐 Запрос доступа к боту
+ID: {uid}
+Имя: {safe_text(message.from_user.full_name)}",
+            reply_markup=kb.as_markup()
         )
-    # если есть доступ, но команда/текст непонятны:
-    await message.answer("Не понял команду. Нажми /start или используй меню.")
+    except Exception:
+        pass
 
+
+
+
+
+# ===================== Access control =====================
+@router.callback_query(F.data.startswith("acc_req:"))
+async def cb_access_req(cq: CallbackQuery):
+    # only owner can press
+    if cq.from_user.id != OWNER_ID:
+        return await cq.answer("Нет доступа", show_alert=True)
+
+    parts = (cq.data or "").split(":")
+    if len(parts) != 3:
+        return await cq.answer("Ошибка", show_alert=True)
+    _, action, uid_s = parts
+    if not uid_s.isdigit():
+        return await cq.answer("Ошибка", show_alert=True)
+    uid = int(uid_s)
+
+    async with Session() as s:
+        exists = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == uid))
+        if action == "allow":
+            if not exists:
+                s.add(AllowedUser(user_id=uid, added_by=OWNER_ID, note="approved"))
+                await s.commit()
+            await cq.message.edit_text(f"✅ Доступ разрешён пользователю {uid}")
+            try:
+                await cq.bot.send_message(uid, "✅ Вам выдан доступ к боту. Напишите /start")
+            except Exception:
+                pass
+            return await cq.answer("Ок")
+        else:
+            await cq.message.edit_text(f"❌ Доступ отклонён пользователю {uid}")
+            try:
+                await cq.bot.send_message(uid, "⛔ Доступ к боту не выдан.")
+            except Exception:
+                pass
+            return await cq.answer("Ок")
 
 # ===================== Warehouses Admin =====================
 @router.message(WarehousesAdmin.adding)
 async def wh_add(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     name = safe_text(message.text)
     if not name:
         return await message.answer("Пусто. Напиши название склада.")
@@ -889,8 +778,6 @@ async def wh_add(message: Message, state: FSMContext):
 
 @router.message(WarehousesAdmin.deleting)
 async def wh_del(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     name = safe_text(message.text)
     async with Session() as s:
         w = await s.scalar(select(Warehouse).where(Warehouse.name == name))
@@ -922,8 +809,6 @@ async def list_warehouses(message: Message):
 # ===================== Products Admin =====================
 @router.message(ProductsAdmin.adding)
 async def prod_add(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     name = safe_text(message.text)
     if not name:
         return await message.answer("Пусто. Напиши название товара.")
@@ -940,8 +825,6 @@ async def prod_add(message: Message, state: FSMContext):
 
 @router.message(ProductsAdmin.deleting)
 async def prod_del(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     name = safe_text(message.text)
     async with Session() as s:
         p = await s.scalar(select(Product).where(Product.name == name))
@@ -973,8 +856,6 @@ async def list_products(message: Message):
 # ===================== Banks Admin =====================
 @router.message(BanksAdmin.adding)
 async def bank_add(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     name = safe_text(message.text)
     if not name:
         return await message.answer("Пусто. Напиши название банка.")
@@ -991,8 +872,6 @@ async def bank_add(message: Message, state: FSMContext):
 
 @router.message(BanksAdmin.deleting)
 async def bank_del(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     name = safe_text(message.text)
     async with Session() as s:
         b = await s.scalar(select(Bank).where(Bank.name == name))
@@ -1031,11 +910,11 @@ async def show_stocks_table(message: Message):
         )).scalars().all()
 
     if not rows:
-        return await message.answer("Остатков пока нет.", reply_markup=main_menu_kb(is_owner_flag=is_owner(message.from_user.id)))
+        return await message.answer("Остатков пока нет.", reply_markup=main_menu_kb())
 
     data = [(r.warehouse.name, r.product.name, fmt_kg(r.qty_kg)) for r in rows if Decimal(r.qty_kg) != 0]
     if not data:
-        return await message.answer("Пока везде 0.", reply_markup=main_menu_kb(is_owner_flag=is_owner(message.from_user.id)))
+        return await message.answer("Пока везде 0.", reply_markup=main_menu_kb())
 
     w1 = max(len("Склад"), max(len(x[0]) for x in data))
     w2 = max(len("Товар"), max(len(x[1]) for x in data))
@@ -1048,8 +927,7 @@ async def show_stocks_table(message: Message):
         lines.append(f"{wh.ljust(w1)} | {pr.ljust(w2)} | {q.rjust(w3)}")
 
     txt = "📦 Остатки:\n<pre>" + "\n".join(lines) + "</pre>"
-    await message.answer(txt, parse_mode=ParseMode.HTML,
-                         reply_markup=main_menu_kb(is_owner_flag=is_owner(message.from_user.id)))
+    await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=main_menu_kb())
 
 
 # ===================== Money =====================
@@ -1113,8 +991,216 @@ async def show_money(message: Message):
     else:
         txt.append("• (пусто)")
 
-    await message.answer("\n".join(txt), parse_mode=ParseMode.MARKDOWN,
-                         reply_markup=main_menu_kb(is_owner_flag=is_owner(message.from_user.id)))
+    await message.answer("\n".join(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb())
+
+
+# ===================== EXPORT TABLES (CHAT) =====================
+EXPORT_PAGE_SIZE = 20  # безопасно для Telegram, можно менять
+
+
+def export_menu_kb():
+    ikb = InlineKeyboardBuilder()
+    ikb.button(text="📦 Остатки", callback_data="exp:stocks:0")
+    ikb.button(text="🟢 Приходы", callback_data="exp:incomes:0")
+    ikb.button(text="🔴 Продажи", callback_data="exp:sales:0")
+    ikb.button(text="⬅️ Назад", callback_data="exp:back")
+    ikb.adjust(2, 1, 1)
+    return ikb.as_markup()
+
+
+def export_pager_kb(kind: str, page: int, has_prev: bool, has_next: bool):
+    ikb = InlineKeyboardBuilder()
+    if has_prev:
+        ikb.button(text="⬅️ Назад", callback_data=f"exp:{kind}:{page-1}")
+    if has_next:
+        ikb.button(text="➡️ Далее", callback_data=f"exp:{kind}:{page+1}")
+    ikb.button(text="🏠 Меню выгрузки", callback_data="exp:menu")
+    ikb.adjust(2, 1)
+    return ikb.as_markup()
+
+
+async def export_menu(message: Message):
+    await message.answer("📥 Выгрузка таблиц (в чате):", reply_markup=export_menu_kb())
+
+
+def _render_pre_table(headers: list[str], rows: list[list[str]]) -> str:
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(cell))
+
+    line1 = " | ".join(headers[i].ljust(widths[i]) for i in range(len(headers)))
+    line2 = "-+-".join("-" * widths[i] for i in range(len(headers)))
+
+    body = []
+    for r in rows:
+        body.append(" | ".join(r[i].ljust(widths[i]) for i in range(len(headers))))
+
+    return "<pre>" + "\n".join([line1, line2] + body) + "</pre>"
+
+
+async def export_stocks_text(page: int):
+    async with Session() as s:
+        rows = (await s.execute(
+            select(Stock)
+            .options(selectinload(Stock.warehouse), selectinload(Stock.product))
+            .order_by(Stock.warehouse_id, Stock.product_id)
+        )).scalars().all()
+
+    data = []
+    for r in rows:
+        q = Decimal(r.qty_kg or 0)
+        if q == 0:
+            continue
+        data.append([r.warehouse.name, r.product.name, fmt_kg(q)])
+
+    if not data:
+        return "📦 Остатки: (везде 0)", None
+
+    total = len(data)
+    start = page * EXPORT_PAGE_SIZE
+    end = start + EXPORT_PAGE_SIZE
+    slice_rows = data[start:end]
+
+    has_prev = page > 0
+    has_next = end < total
+
+    txt = "📦 Остатки:\n" + _render_pre_table(
+        headers=["Склад", "Товар", "Остаток(кг)"],
+        rows=slice_rows
+    )
+    kb = export_pager_kb("stocks", page, has_prev, has_next)
+    return txt, kb
+
+
+async def export_incomes_text(page: int):
+    async with Session() as s:
+        rows = (await s.execute(
+            select(Income)
+            .options(selectinload(Income.warehouse), selectinload(Income.product))
+            .order_by(Income.id.desc())
+            .limit(50)
+        )).scalars().all()
+
+    if not rows:
+        return "🟢 Приходы: записей нет.", None
+
+    data = []
+    for r in rows:
+        data.append([
+            str(r.doc_date),
+            r.warehouse.name if r.warehouse else "-",
+            r.product.name if r.product else "-",
+            fmt_kg(Decimal(r.qty_kg or 0)),
+        ])
+
+    total = len(data)
+    start = page * EXPORT_PAGE_SIZE
+    end = start + EXPORT_PAGE_SIZE
+    slice_rows = data[start:end]
+
+    has_prev = page > 0
+    has_next = end < total
+
+    txt = "🟢 Приходы (последние 50):\n" + _render_pre_table(
+        headers=["Дата", "Склад", "Товар", "Кол-во(кг)"],
+        rows=slice_rows
+    )
+    kb = export_pager_kb("incomes", page, has_prev, has_next)
+    return txt, kb
+
+
+async def export_sales_text(page: int):
+    async with Session() as s:
+        rows = (await s.execute(
+            select(Sale)
+            .options(selectinload(Sale.warehouse), selectinload(Sale.product))
+            .order_by(Sale.id.desc())
+            .limit(50)
+        )).scalars().all()
+
+    if not rows:
+        return "🔴 Продажи: записей нет.", None
+
+    data = []
+    for r in rows:
+        who = safe_text(r.customer_name) or "-"
+        paid = "✅" if r.is_paid else "🧾"
+        data.append([
+            str(r.doc_date),
+            who,
+            r.warehouse.name if r.warehouse else "-",
+            r.product.name if r.product else "-",
+            fmt_kg(Decimal(r.qty_kg or 0)),
+            fmt_money(Decimal(r.price_per_kg or 0)),
+            fmt_money(Decimal(r.total_amount or 0)),
+            paid
+        ])
+
+    total = len(data)
+    start = page * EXPORT_PAGE_SIZE
+    end = start + EXPORT_PAGE_SIZE
+    slice_rows = data[start:end]
+
+    has_prev = page > 0
+    has_next = end < total
+
+    txt = "🔴 Продажи (последние 50):\n" + _render_pre_table(
+        headers=["Дата", "Кому", "Склад", "Товар", "Кол-во(кг)", "Цена/кг", "Сумма", "Опл"],
+        rows=slice_rows
+    )
+    kb = export_pager_kb("sales", page, has_prev, has_next)
+    return txt, kb
+
+
+@router.callback_query(F.data.startswith("exp:"))
+async def export_router(cq: CallbackQuery):
+    """
+    exp:menu
+    exp:back
+    exp:stocks:0
+    exp:incomes:1
+    exp:sales:2
+    """
+    parts = (cq.data or "").split(":")
+    if len(parts) < 2:
+        return await cq.answer()
+
+    action = parts[1]
+
+    if action == "menu":
+        await cq.message.answer("📥 Выгрузка таблиц (в чате):", reply_markup=export_menu_kb())
+        return await cq.answer()
+
+    if action == "back":
+        await cq.message.answer("Меню:", reply_markup=main_menu_kb())
+        return await cq.answer()
+
+    if len(parts) != 3:
+        return await cq.answer("Ошибка кнопки", show_alert=True)
+
+    kind = parts[1]
+    page_s = parts[2]
+    if not page_s.isdigit():
+        return await cq.answer("Ошибка страницы", show_alert=True)
+    page = int(page_s)
+
+    if kind == "stocks":
+        txt, kb = await export_stocks_text(page)
+        await cq.message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return await cq.answer()
+
+    if kind == "incomes":
+        txt, kb = await export_incomes_text(page)
+        await cq.message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return await cq.answer()
+
+    if kind == "sales":
+        txt, kb = await export_sales_text(page)
+        await cq.message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return await cq.answer()
+
+    return await cq.answer("Неизвестный раздел", show_alert=True)
 
 
 # ===================== Lists (Sales/Incomes/Debtors) =====================
@@ -1129,8 +1215,6 @@ def sales_actions_kb(sale_id: int, paid: bool):
 
 @router.callback_query(F.data.startswith("sale_paid_id:"))
 async def cb_sale_paid_id(cq: CallbackQuery):
-    if not await guard_callback(cq):
-        return
     part = cq.data.split(":", 1)[1] if cq.data else ""
     if not part.isdigit():
         return await cq.answer("Ошибка кнопки. Обнови сообщение.", show_alert=True)
@@ -1178,8 +1262,6 @@ async def cb_sale_paid_id(cq: CallbackQuery):
 
 @router.callback_query(F.data.startswith("sale_del:"))
 async def cb_sale_del(cq: CallbackQuery):
-    if not await guard_callback(cq):
-        return
     part = cq.data.split(":", 1)[1] if cq.data else ""
     if not part.isdigit():
         return await cq.answer("Ошибка кнопки", show_alert=True)
@@ -1206,7 +1288,7 @@ async def list_sales(message: Message):
         )).scalars().all()
 
     if not rows:
-        return await message.answer("Продаж пока нет.", reply_markup=main_menu_kb(is_owner_flag=is_owner(message.from_user.id)))
+        return await message.answer("Продаж пока нет.", reply_markup=main_menu_kb())
 
     lines = ["📄 *Последние продажи* (последние 30):"]
     for r in rows:
@@ -1220,16 +1302,13 @@ async def list_sales(message: Message):
             f"Куда: *{where_txt}*"
         )
 
-    await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN,
-                         reply_markup=main_menu_kb(is_owner_flag=is_owner(message.from_user.id)))
+    await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb())
     await message.answer("Чтобы управлять: напиши `продажа #ID` например: `продажа #12`",
-                         reply_markup=main_menu_kb(is_owner_flag=is_owner(message.from_user.id)))
+                         reply_markup=main_menu_kb())
 
 
 @router.message(F.text.regexp(r"(?i)^продажа\s+#\d+$"))
 async def sale_by_id(message: Message):
-    if not await guard_message(message):
-        return
     sale_id = int(message.text.split("#")[1])
     async with Session() as s:
         r = await s.scalar(
@@ -1238,7 +1317,7 @@ async def sale_by_id(message: Message):
             .where(Sale.id == sale_id)
         )
     if not r:
-        return await message.answer("Не найдено.", reply_markup=main_menu_kb(is_owner_flag=is_owner(message.from_user.id)))
+        return await message.answer("Не найдено.", reply_markup=main_menu_kb())
 
     paid = "✅ Оплачено" if r.is_paid else "🧾 Не оплачено"
     acc = {"cash": "Наличные", "bank": "Банк", "ip": "Счёт ИП"}.get(r.account_type, "-")
@@ -1271,8 +1350,6 @@ def income_actions_kb(income_id: int):
 
 @router.callback_query(F.data.startswith("inc_del:"))
 async def cb_inc_del(cq: CallbackQuery):
-    if not await guard_callback(cq):
-        return
     part = cq.data.split(":", 1)[1] if cq.data else ""
     if not part.isdigit():
         return await cq.answer("Ошибка кнопки", show_alert=True)
@@ -1297,7 +1374,7 @@ async def list_incomes(message: Message):
         )).scalars().all()
 
     if not rows:
-        return await message.answer("Приходов пока нет.", reply_markup=main_menu_kb(is_owner_flag=is_owner(message.from_user.id)))
+        return await message.answer("Приходов пока нет.", reply_markup=main_menu_kb())
 
     lines = ["📄 *Последние приходы* (последние 30):"]
     for r in rows:
@@ -1310,16 +1387,13 @@ async def list_incomes(message: Message):
             f"Расход денег: *{'✅' if r.add_money_entry else '❌'}* | Куда: *{where_txt}*"
         )
 
-    await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN,
-                         reply_markup=main_menu_kb(is_owner_flag=is_owner(message.from_user.id)))
+    await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb())
     await message.answer("Чтобы посмотреть: напиши `приход #ID` например: `приход #7`",
-                         reply_markup=main_menu_kb(is_owner_flag=is_owner(message.from_user.id)))
+                         reply_markup=main_menu_kb())
 
 
 @router.message(F.text.regexp(r"(?i)^приход\s+#\d+$"))
 async def inc_by_id(message: Message):
-    if not await guard_message(message):
-        return
     inc_id = int(message.text.split("#")[1])
     async with Session() as s:
         r = await s.scalar(
@@ -1328,7 +1402,7 @@ async def inc_by_id(message: Message):
             .where(Income.id == inc_id)
         )
     if not r:
-        return await message.answer("Не найдено.", reply_markup=main_menu_kb(is_owner_flag=is_owner(message.from_user.id)))
+        return await message.answer("Не найдено.", reply_markup=main_menu_kb())
 
     acc = {"cash": "Наличные", "bank": "Банк", "ip": "Счёт ИП"}.get(r.account_type, "-")
     bank_name = r.bank.name if r.bank else "-"
@@ -1363,8 +1437,6 @@ def debtor_actions_kb(debtor_id: int, paid: bool):
 
 @router.callback_query(F.data.startswith("deb_paid:"))
 async def cb_deb_paid(cq: CallbackQuery):
-    if not await guard_callback(cq):
-        return
     part = cq.data.split(":", 1)[1] if cq.data else ""
     if not part.isdigit():
         return await cq.answer("Ошибка кнопки", show_alert=True)
@@ -1381,8 +1453,6 @@ async def cb_deb_paid(cq: CallbackQuery):
 
 @router.callback_query(F.data.startswith("deb_del:"))
 async def cb_deb_del(cq: CallbackQuery):
-    if not await guard_callback(cq):
-        return
     part = cq.data.split(":", 1)[1] if cq.data else ""
     if not part.isdigit():
         return await cq.answer("Ошибка кнопки", show_alert=True)
@@ -1401,7 +1471,7 @@ async def list_debtors(message: Message):
         )).scalars().all()
 
     if not rows:
-        return await message.answer("Должников нет ✅", reply_markup=main_menu_kb(is_owner_flag=is_owner(message.from_user.id)))
+        return await message.answer("Должников нет ✅", reply_markup=main_menu_kb())
 
     lines = ["📋 *Должники* (последние 50):"]
     for r in rows:
@@ -1411,21 +1481,18 @@ async def list_debtors(message: Message):
             f"{r.warehouse_name} / {r.product_name} — {fmt_kg(r.qty_kg)} кг × {fmt_money(r.price_per_kg)} = *{fmt_money(r.total_amount)}*"
         )
 
-    await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN,
-                         reply_markup=main_menu_kb(is_owner_flag=is_owner(message.from_user.id)))
+    await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb())
     await message.answer("Чтобы управлять: напиши `должник #ID` например: `должник #3`",
-                         reply_markup=main_menu_kb(is_owner_flag=is_owner(message.from_user.id)))
+                         reply_markup=main_menu_kb())
 
 
 @router.message(F.text.regexp(r"(?i)^должник\s+#\d+$"))
 async def debtor_by_id(message: Message):
-    if not await guard_message(message):
-        return
     d_id = int(message.text.split("#")[1])
     async with Session() as s:
         r = await s.get(Debtor, d_id)
     if not r:
-        return await message.answer("Не найдено.", reply_markup=main_menu_kb(is_owner_flag=is_owner(message.from_user.id)))
+        return await message.answer("Не найдено.", reply_markup=main_menu_kb())
 
     status = "✅ Оплачено" if r.is_paid else "🧾 Не оплачено"
     txt = (
@@ -1542,8 +1609,6 @@ async def start_sale(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("cal:sale:"))
 async def cal_sale_handler(cq: CallbackQuery, state: FSMContext):
-    if not await guard_callback(cq):
-        return
     # cal:sale:action:payload
     parts = (cq.data or "").split(":", 3)
     if len(parts) < 4:
@@ -1569,8 +1634,7 @@ async def cal_sale_handler(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("sale_nav:"))
 async def sale_nav_handler(cq: CallbackQuery, state: FSMContext):
-    if not await guard_callback(cq):
-        return
+    # sale_nav:field:action
     parts = (cq.data or "").split(":", 2)
     if len(parts) < 3:
         return await cq.answer()
@@ -1600,7 +1664,7 @@ async def sale_nav_handler(cq: CallbackQuery, state: FSMContext):
     if action == "back":
         if idx == 0:
             await state.clear()
-            await cq.message.answer("Отменено ✅", reply_markup=main_menu_kb(is_owner_flag=is_owner(cq.from_user.id)))
+            await cq.message.answer("Отменено ✅", reply_markup=main_menu_kb())
             return await cq.answer()
         prev_key = SALE_FLOW[idx - 1]
         await sale_go_to(state, prev_key)
@@ -1625,8 +1689,6 @@ async def sale_nav_handler(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("sale_wh:"))
 async def sale_choose_wh(cq: CallbackQuery, state: FSMContext):
-    if not await guard_callback(cq):
-        return
     parts = parse_cb(cq.data, "sale_wh")
     if not parts:
         return await cq.answer()
@@ -1654,8 +1716,6 @@ async def sale_choose_wh(cq: CallbackQuery, state: FSMContext):
 
 @router.message(SaleWizard.adding_warehouse)
 async def sale_add_warehouse_inline(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     name = safe_text(message.text)
     if not name:
         return await message.answer("Пусто. Напиши название склада:")
@@ -1672,8 +1732,6 @@ async def sale_add_warehouse_inline(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("sale_pr:"))
 async def sale_choose_pr(cq: CallbackQuery, state: FSMContext):
-    if not await guard_callback(cq):
-        return
     parts = parse_cb(cq.data, "sale_pr")
     if not parts:
         return await cq.answer()
@@ -1701,8 +1759,6 @@ async def sale_choose_pr(cq: CallbackQuery, state: FSMContext):
 
 @router.message(SaleWizard.adding_product)
 async def sale_add_product_inline(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     name = safe_text(message.text)
     if not name:
         return await message.answer("Пусто. Напиши название товара:")
@@ -1719,8 +1775,6 @@ async def sale_add_product_inline(message: Message, state: FSMContext):
 
 @router.message(SaleWizard.customer_name)
 async def sale_customer_name(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     txt = safe_text(message.text) or "-"
     await state.update_data(customer_name=txt)
     await sale_go_to(state, "customer_phone")
@@ -1729,8 +1783,6 @@ async def sale_customer_name(message: Message, state: FSMContext):
 
 @router.message(SaleWizard.customer_phone)
 async def sale_customer_phone(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     txt = safe_phone(message.text) or "-"
     await state.update_data(customer_phone=txt)
     await sale_go_to(state, "warehouse_id")
@@ -1739,8 +1791,6 @@ async def sale_customer_phone(message: Message, state: FSMContext):
 
 @router.message(SaleWizard.qty)
 async def sale_qty(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     try:
         q = dec(message.text)
         if q <= 0:
@@ -1754,8 +1804,6 @@ async def sale_qty(message: Message, state: FSMContext):
 
 @router.message(SaleWizard.price)
 async def sale_price(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     try:
         p = dec(message.text)
         if p < 0:
@@ -1769,8 +1817,6 @@ async def sale_price(message: Message, state: FSMContext):
 
 @router.message(SaleWizard.delivery)
 async def sale_delivery(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     txt = safe_text(message.text)
     if txt == "":
         txt = "0"
@@ -1787,8 +1833,6 @@ async def sale_delivery(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("sale_status:"))
 async def sale_status_chosen(cq: CallbackQuery, state: FSMContext):
-    if not await guard_callback(cq):
-        return
     status = cq.data.split(":", 1)[1] if cq.data else ""
     if status == "paid":
         await state.update_data(is_paid=True)
@@ -1803,8 +1847,6 @@ async def sale_status_chosen(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("sale_pay:"))
 async def sale_pay_method(cq: CallbackQuery, state: FSMContext):
-    if not await guard_callback(cq):
-        return
     method = cq.data.split(":", 1)[1] if cq.data else "cash"
     await state.update_data(payment_method=method)
     await sale_go_to(state, "account_type")
@@ -1814,8 +1856,6 @@ async def sale_pay_method(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("sale_acc:"))
 async def sale_account_type_pick(cq: CallbackQuery, state: FSMContext):
-    if not await guard_callback(cq):
-        return
     acc = cq.data.split(":", 1)[1] if cq.data else "cash"
     await state.update_data(account_type=acc)
 
@@ -1832,8 +1872,6 @@ async def sale_account_type_pick(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("sale_bank:"))
 async def sale_bank_pick(cq: CallbackQuery, state: FSMContext):
-    if not await guard_callback(cq):
-        return
     parts = parse_cb(cq.data, "sale_bank")
     if not parts:
         return await cq.answer()
@@ -1861,8 +1899,6 @@ async def sale_bank_pick(cq: CallbackQuery, state: FSMContext):
 
 @router.message(SaleWizard.adding_bank)
 async def sale_add_bank_inline(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     name = safe_text(message.text)
     if not name:
         return await message.answer("Пусто. Напиши название банка:")
@@ -1916,12 +1952,10 @@ def build_sale_summary(data: dict) -> str:
 
 @router.callback_query(F.data.startswith("sale_confirm:"))
 async def sale_confirm(cq: CallbackQuery, state: FSMContext):
-    if not await guard_callback(cq):
-        return
     ch = cq.data.split(":", 1)[1] if cq.data else "no"
     if ch == "no":
         await state.clear()
-        await cq.message.answer("Отменено ✅", reply_markup=main_menu_kb(is_owner_flag=is_owner(cq.from_user.id)))
+        await cq.message.answer("Отменено ✅", reply_markup=main_menu_kb())
         return await cq.answer()
 
     data = await state.get_data()
@@ -1959,8 +1993,7 @@ async def sale_confirm(cq: CallbackQuery, state: FSMContext):
         p = await s.get(Product, product_id)
         if not w or not p:
             await state.clear()
-            await cq.message.answer("Ошибка: склад/товар не найден. Проверь справочники.",
-                                    reply_markup=main_menu_kb(is_owner_flag=is_owner(cq.from_user.id)))
+            await cq.message.answer("Ошибка: склад/товар не найден. Проверь справочники.", reply_markup=main_menu_kb())
             return await cq.answer()
 
         if account_type in ("bank", "ip"):
@@ -1969,10 +2002,8 @@ async def sale_confirm(cq: CallbackQuery, state: FSMContext):
                 await cq.answer("Банк не найден", show_alert=True)
                 return
 
-        # гарантируем строку остатков
         await get_stock_row(s, w.id, p.id)
 
-        # ====== запрет продажи в минус + атомарное списание ======
         res = await s.execute(
             update(Stock)
             .where(
@@ -1995,7 +2026,7 @@ async def sale_confirm(cq: CallbackQuery, state: FSMContext):
             await state.clear()
             await cq.message.answer(
                 f"❗ Недостаточно товара.\nЕсть: {fmt_kg(cur_qty)} кг, нужно: {fmt_kg(qty)} кг",
-                reply_markup=main_menu_kb(is_owner_flag=is_owner(cq.from_user.id))
+                reply_markup=main_menu_kb()
             )
             return await cq.answer()
 
@@ -2044,7 +2075,7 @@ async def sale_confirm(cq: CallbackQuery, state: FSMContext):
         await s.commit()
 
     await state.clear()
-    await cq.message.answer("✅ Продажа сохранена.", reply_markup=main_menu_kb(is_owner_flag=is_owner(cq.from_user.id)))
+    await cq.message.answer("✅ Продажа сохранена.", reply_markup=main_menu_kb())
     await cq.answer()
 
 
@@ -2146,8 +2177,6 @@ async def start_income(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("cal:inc:"))
 async def cal_inc_handler(cq: CallbackQuery, state: FSMContext):
-    if not await guard_callback(cq):
-        return
     parts = (cq.data or "").split(":", 3)
     if len(parts) < 4:
         return await cq.answer()
@@ -2172,8 +2201,6 @@ async def cal_inc_handler(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("inc_nav:"))
 async def inc_nav_handler(cq: CallbackQuery, state: FSMContext):
-    if not await guard_callback(cq):
-        return
     parts = (cq.data or "").split(":", 2)
     if len(parts) < 3:
         return await cq.answer()
@@ -2203,7 +2230,7 @@ async def inc_nav_handler(cq: CallbackQuery, state: FSMContext):
     if action == "back":
         if idx == 0:
             await state.clear()
-            await cq.message.answer("Отменено ✅", reply_markup=main_menu_kb(is_owner_flag=is_owner(cq.from_user.id)))
+            await cq.message.answer("Отменено ✅", reply_markup=main_menu_kb())
             return await cq.answer()
         prev_key = INCOME_FLOW[idx - 1]
         await income_go_to(state, prev_key)
@@ -2228,8 +2255,6 @@ async def inc_nav_handler(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("inc_wh:"))
 async def inc_choose_wh(cq: CallbackQuery, state: FSMContext):
-    if not await guard_callback(cq):
-        return
     parts = parse_cb(cq.data, "inc_wh")
     if not parts:
         return await cq.answer()
@@ -2257,8 +2282,6 @@ async def inc_choose_wh(cq: CallbackQuery, state: FSMContext):
 
 @router.message(IncomeWizard.adding_warehouse)
 async def inc_add_warehouse_inline(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     name = safe_text(message.text)
     if not name:
         return await message.answer("Пусто. Напиши название склада:")
@@ -2275,8 +2298,6 @@ async def inc_add_warehouse_inline(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("inc_pr:"))
 async def inc_choose_pr(cq: CallbackQuery, state: FSMContext):
-    if not await guard_callback(cq):
-        return
     parts = parse_cb(cq.data, "inc_pr")
     if not parts:
         return await cq.answer()
@@ -2304,8 +2325,6 @@ async def inc_choose_pr(cq: CallbackQuery, state: FSMContext):
 
 @router.message(IncomeWizard.adding_product)
 async def inc_add_product_inline(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     name = safe_text(message.text)
     if not name:
         return await message.answer("Пусто. Напиши название товара:")
@@ -2322,8 +2341,6 @@ async def inc_add_product_inline(message: Message, state: FSMContext):
 
 @router.message(IncomeWizard.supplier_name)
 async def inc_supplier_name(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     txt = safe_text(message.text) or "-"
     await state.update_data(supplier_name=txt)
     await income_go_to(state, "supplier_phone")
@@ -2332,8 +2349,6 @@ async def inc_supplier_name(message: Message, state: FSMContext):
 
 @router.message(IncomeWizard.supplier_phone)
 async def inc_supplier_phone(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     txt = safe_phone(message.text) or "-"
     await state.update_data(supplier_phone=txt)
     await income_go_to(state, "warehouse_id")
@@ -2342,8 +2357,6 @@ async def inc_supplier_phone(message: Message, state: FSMContext):
 
 @router.message(IncomeWizard.qty)
 async def inc_qty(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     try:
         q = dec(message.text)
         if q <= 0:
@@ -2357,8 +2370,6 @@ async def inc_qty(message: Message, state: FSMContext):
 
 @router.message(IncomeWizard.price)
 async def inc_price(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     try:
         p = dec(message.text)
         if p < 0:
@@ -2372,8 +2383,6 @@ async def inc_price(message: Message, state: FSMContext):
 
 @router.message(IncomeWizard.delivery)
 async def inc_delivery(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     txt = safe_text(message.text)
     if txt == "":
         txt = "0"
@@ -2390,8 +2399,6 @@ async def inc_delivery(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("inc_money:"))
 async def inc_money_choice(cq: CallbackQuery, state: FSMContext):
-    if not await guard_callback(cq):
-        return
     ch = cq.data.split(":", 1)[1] if cq.data else "no"
     if ch == "yes":
         await state.update_data(add_money_entry=True)
@@ -2406,8 +2413,6 @@ async def inc_money_choice(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("inc_pay:"))
 async def inc_pay_choice(cq: CallbackQuery, state: FSMContext):
-    if not await guard_callback(cq):
-        return
     method = cq.data.split(":", 1)[1] if cq.data else "cash"
     await state.update_data(payment_method=method)
     await income_go_to(state, "account_type")
@@ -2417,8 +2422,6 @@ async def inc_pay_choice(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("inc_acc:"))
 async def inc_account_type_pick(cq: CallbackQuery, state: FSMContext):
-    if not await guard_callback(cq):
-        return
     acc = cq.data.split(":", 1)[1] if cq.data else "cash"
     await state.update_data(account_type=acc)
 
@@ -2435,8 +2438,6 @@ async def inc_account_type_pick(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("inc_bank:"))
 async def inc_bank_pick(cq: CallbackQuery, state: FSMContext):
-    if not await guard_callback(cq):
-        return
     parts = parse_cb(cq.data, "inc_bank")
     if not parts:
         return await cq.answer()
@@ -2464,8 +2465,6 @@ async def inc_bank_pick(cq: CallbackQuery, state: FSMContext):
 
 @router.message(IncomeWizard.adding_bank)
 async def inc_add_bank_inline(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     name = safe_text(message.text)
     if not name:
         return await message.answer("Пусто. Напиши название банка:")
@@ -2518,12 +2517,10 @@ def build_income_summary(data: dict) -> str:
 
 @router.callback_query(F.data.startswith("inc_confirm:"))
 async def inc_confirm(cq: CallbackQuery, state: FSMContext):
-    if not await guard_callback(cq):
-        return
     ch = cq.data.split(":", 1)[1] if cq.data else "no"
     if ch == "no":
         await state.clear()
-        await cq.message.answer("Отменено ✅", reply_markup=main_menu_kb(is_owner_flag=is_owner(cq.from_user.id)))
+        await cq.message.answer("Отменено ✅", reply_markup=main_menu_kb())
         return await cq.answer()
 
     data = await state.get_data()
@@ -2561,8 +2558,7 @@ async def inc_confirm(cq: CallbackQuery, state: FSMContext):
         p = await s.get(Product, product_id)
         if not w or not p:
             await state.clear()
-            await cq.message.answer("Ошибка: склад/товар не найден. Проверь справочники.",
-                                    reply_markup=main_menu_kb(is_owner_flag=is_owner(cq.from_user.id)))
+            await cq.message.answer("Ошибка: склад/товар не найден. Проверь справочники.", reply_markup=main_menu_kb())
             return await cq.answer()
 
         if account_type in ("bank", "ip"):
@@ -2606,7 +2602,7 @@ async def inc_confirm(cq: CallbackQuery, state: FSMContext):
         await s.commit()
 
     await state.clear()
-    await cq.message.answer("✅ Приход сохранён.", reply_markup=main_menu_kb(is_owner_flag=is_owner(cq.from_user.id)))
+    await cq.message.answer("✅ Приход сохранён.", reply_markup=main_menu_kb())
     await cq.answer()
 
 
@@ -2619,8 +2615,6 @@ async def start_debtor(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("cal:deb:"))
 async def cal_deb_handler(cq: CallbackQuery, state: FSMContext):
-    if not await guard_callback(cq):
-        return
     parts = (cq.data or "").split(":", 3)
     if len(parts) < 4:
         return await cq.answer()
@@ -2643,8 +2637,6 @@ async def cal_deb_handler(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("deb_nav:"))
 async def deb_nav_handler(cq: CallbackQuery, state: FSMContext):
-    if not await guard_callback(cq):
-        return
     parts = (cq.data or "").split(":", 2)
     if len(parts) < 3:
         return await cq.answer()
@@ -2679,7 +2671,7 @@ async def deb_nav_handler(cq: CallbackQuery, state: FSMContext):
             await cq.message.answer("Доставка (0 если нет):", reply_markup=nav_kb("deb_nav:delivery", allow_skip=True))
         else:
             await state.clear()
-            await cq.message.answer("Меню:", reply_markup=main_menu_kb(is_owner_flag=is_owner(cq.from_user.id)))
+            await cq.message.answer("Меню:", reply_markup=main_menu_kb())
         return await cq.answer()
 
     if action == "skip":
@@ -2703,8 +2695,6 @@ async def deb_nav_handler(cq: CallbackQuery, state: FSMContext):
 
 @router.message(DebtorWizard.customer_name)
 async def deb_name(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     await state.update_data(customer_name=safe_text(message.text))
     await state.set_state(DebtorWizard.customer_phone)
     await message.answer("Телефон клиента:", reply_markup=nav_kb("deb_nav:customer_phone", allow_skip=True))
@@ -2712,8 +2702,6 @@ async def deb_name(message: Message, state: FSMContext):
 
 @router.message(DebtorWizard.customer_phone)
 async def deb_phone(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     await state.update_data(customer_phone=safe_phone(message.text) or "-")
     await state.set_state(DebtorWizard.warehouse_name)
     await message.answer("Склад (текст):", reply_markup=nav_kb("deb_nav:warehouse_name", allow_skip=False))
@@ -2721,8 +2709,6 @@ async def deb_phone(message: Message, state: FSMContext):
 
 @router.message(DebtorWizard.warehouse_name)
 async def deb_wh(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     await state.update_data(warehouse_name=safe_text(message.text))
     await state.set_state(DebtorWizard.product_name)
     await message.answer("Товар (текст):", reply_markup=nav_kb("deb_nav:product_name", allow_skip=False))
@@ -2730,8 +2716,6 @@ async def deb_wh(message: Message, state: FSMContext):
 
 @router.message(DebtorWizard.product_name)
 async def deb_pr(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     await state.update_data(product_name=safe_text(message.text))
     await state.set_state(DebtorWizard.qty)
     await message.answer("Кол-во (кг):", reply_markup=nav_kb("deb_nav:qty", allow_skip=False))
@@ -2739,8 +2723,6 @@ async def deb_pr(message: Message, state: FSMContext):
 
 @router.message(DebtorWizard.qty)
 async def deb_qty(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     try:
         q = dec(message.text)
         if q < 0:
@@ -2754,8 +2736,6 @@ async def deb_qty(message: Message, state: FSMContext):
 
 @router.message(DebtorWizard.price)
 async def deb_price(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     try:
         p = dec(message.text)
         if p < 0:
@@ -2769,8 +2749,6 @@ async def deb_price(message: Message, state: FSMContext):
 
 @router.message(DebtorWizard.delivery)
 async def deb_delivery(message: Message, state: FSMContext):
-    if not await guard_message(message):
-        return
     txt = safe_text(message.text)
     if txt == "":
         txt = "0"
@@ -2808,12 +2786,10 @@ def build_debtor_summary(data: dict) -> str:
 
 @router.callback_query(F.data.startswith("deb_confirm:"))
 async def deb_confirm(cq: CallbackQuery, state: FSMContext):
-    if not await guard_callback(cq):
-        return
     ch = cq.data.split(":", 1)[1] if cq.data else "no"
     if ch == "no":
         await state.clear()
-        await cq.message.answer("Отменено ✅", reply_markup=main_menu_kb(is_owner_flag=is_owner(cq.from_user.id)))
+        await cq.message.answer("Отменено ✅", reply_markup=main_menu_kb())
         return await cq.answer()
 
     data = await state.get_data()
@@ -2840,7 +2816,7 @@ async def deb_confirm(cq: CallbackQuery, state: FSMContext):
         await s.commit()
 
     await state.clear()
-    await cq.message.answer("✅ Должник добавлен.", reply_markup=main_menu_kb(is_owner_flag=is_owner(cq.from_user.id)))
+    await cq.message.answer("✅ Должник добавлен.", reply_markup=main_menu_kb())
     await cq.answer()
 
 
@@ -2848,17 +2824,19 @@ async def deb_confirm(cq: CallbackQuery, state: FSMContext):
 async def main():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # migrations for allowed_users table / columns
+        await ensure_allowed_users_schema(conn)
+
+    # ensure owner is in allowed_users (optional but useful for listing)
+    async with Session() as s:
+        exists = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == OWNER_ID))
+        if not exists:
+            s.add(AllowedUser(user_id=OWNER_ID, added_by=OWNER_ID, note="owner"))
+            await s.commit()
 
     bot = Bot(TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-
-    # добавим OWNER в доступ автоматически (считай "суперюзер")
-    async with Session() as s:
-        exists = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == OWNER_ID))
-        if not exists:
-            s.add(AllowedUser(user_id=OWNER_ID, added_by=OWNER_ID, note="OWNER"))
-            await s.commit()
 
     await bot.delete_webhook(drop_pending_updates=True)
     print("=== BOT STARTED OK ===", flush=True)
@@ -2867,3 +2845,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
