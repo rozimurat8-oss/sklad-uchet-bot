@@ -179,7 +179,7 @@ class AllowedUser(Base):
     __tablename__ = "allowed_users"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
-    added_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     added_by: Mapped[int] = mapped_column(Integer, default=0)
     note: Mapped[str] = mapped_column(String(300), default="")
 
@@ -193,7 +193,7 @@ async def ensure_allowed_users_schema(conn):
         CREATE TABLE IF NOT EXISTS allowed_users (
             id INTEGER PRIMARY KEY,
             user_id INTEGER NOT NULL UNIQUE,
-            added_at DATETIME,
+            created_at DATETIME,
             added_by INTEGER,
             note VARCHAR(300)
         )
@@ -202,12 +202,20 @@ async def ensure_allowed_users_schema(conn):
 
     # Add missing columns (older DB may have only id/user_id)
     cols = [row[1] for row in (await conn.exec_driver_sql("PRAGMA table_info(allowed_users)")).fetchall()]
-    if "added_at" not in cols:
-        await conn.exec_driver_sql("ALTER TABLE allowed_users ADD COLUMN added_at DATETIME")
+    if "created_at" not in cols:
+        await conn.exec_driver_sql("ALTER TABLE allowed_users ADD COLUMN created_at DATETIME")
     if "added_by" not in cols:
         await conn.exec_driver_sql("ALTER TABLE allowed_users ADD COLUMN added_by INTEGER")
     if "note" not in cols:
         await conn.exec_driver_sql("ALTER TABLE allowed_users ADD COLUMN note VARCHAR(300)")
+
+    # Fill NULL created_at (legacy rows)
+    try:
+        await conn.exec_driver_sql(
+            "UPDATE allowed_users SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP) WHERE created_at IS NULL"
+        )
+    except Exception:
+        pass
 
 engine = create_async_engine(DB_URL, echo=False)
 Session = async_sessionmaker(engine, expire_on_commit=False)
@@ -2848,5 +2856,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
