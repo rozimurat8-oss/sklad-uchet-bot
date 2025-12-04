@@ -690,6 +690,7 @@ async def render_users_page(page: int) -> tuple[str, list[User], set[int]]:
 
     lines = [f"👥 <b>Users</b> (всего: <b>{total}</b>), стр <b>{page+1}</b>:
 "]
+"]
 for u in users:
         st = "✅" if (u.user_id in allowed_ids or is_owner(u.user_id)) else "⛔"
         uname = f"@{h(u.username)}" if u.username else "-"
@@ -884,7 +885,7 @@ async def show_money(message: Message, state: FSMContext):
     else:
         txt.append("• (пусто)")
 
-    await message.answer("\n".join(txt), parse_mode=ParseMode.MARKDOWN)
+    await message.answer("\n".join(txt), parse_mode=ParseMode.HTML)
     await reply_in_menu(message, state, "Готово ✅")
 
 
@@ -1191,9 +1192,9 @@ async def list_sales(message: Message, state: FSMContext):
             f"Куда: *{where_txt}*"
         )
 
-    await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
     await reply_in_menu(message, state, "Чтобы управлять: напиши `продажа #ID` например: `продажа #12`",
-                        parse_mode=ParseMode.MARKDOWN)
+                        parse_mode=ParseMode.HTML)
 
 
 @router.message(F.text.regexp(r"(?i)^продажа\s+#\d+$"))
@@ -1226,7 +1227,7 @@ async def sale_by_id(message: Message, state: FSMContext):
         f"Статус: *{paid}*\n"
         f"Куда: *{where_txt}*"
     )
-    await message.answer(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=sales_actions_kb(r.id, r.is_paid))
+    await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=sales_actions_kb(r.id, r.is_paid))
 
 
 def income_actions_kb(income_id: int):
@@ -1275,9 +1276,9 @@ async def list_incomes(message: Message, state: FSMContext):
             f"Расход денег: *{'✅' if r.add_money_entry else '❌'}* | Куда: *{where_txt}*"
         )
 
-    await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
     await reply_in_menu(message, state, "Чтобы посмотреть: напиши `приход #ID` например: `приход #7`",
-                        parse_mode=ParseMode.MARKDOWN)
+                        parse_mode=ParseMode.HTML)
 
 
 @router.message(F.text.regexp(r"(?i)^приход\s+#\d+$"))
@@ -1309,7 +1310,7 @@ async def inc_by_id(message: Message, state: FSMContext):
         f"Расход денег по приходу: *{'✅' if r.add_money_entry else '❌'}*\n"
         f"Куда: *{where_txt}*"
     )
-    await message.answer(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=income_actions_kb(r.id))
+    await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=income_actions_kb(r.id))
 
 
 def debtor_actions_kb(debtor_id: int, paid: bool):
@@ -1365,9 +1366,9 @@ async def list_debtors(message: Message, state: FSMContext):
             f"{r.warehouse_name} / {r.product_name} — {fmt_kg(r.qty_kg)} кг × {fmt_money(r.price_per_kg)} = *{fmt_money(r.total_amount)}*"
         )
 
-    await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
     await reply_in_menu(message, state, "Чтобы управлять: напиши `должник #ID` например: `должник #3`",
-                        parse_mode=ParseMode.MARKDOWN)
+                        parse_mode=ParseMode.HTML)
 
 
 @router.message(F.text.regexp(r"(?i)^должник\s+#\d+$"))
@@ -1391,7 +1392,7 @@ async def debtor_by_id(message: Message, state: FSMContext):
         f"Доставка: *{fmt_money(r.delivery_cost)}*\n"
         f"Статус: *{status}*"
     )
-    await message.answer(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=debtor_actions_kb(r.id, r.is_paid))
+    await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=debtor_actions_kb(r.id, r.is_paid))
 
 
 @router.message(Command("start"))
@@ -1497,7 +1498,7 @@ async def cmd_users(message: Message, state: FSMContext):
     page = 0
     txt, users, has_prev, has_next, allowed_ids, real_page = await render_users_page(page)
     kb = users_list_kb(real_page, users, allowed_ids, has_prev, has_next) if users else users_pager_kb(real_page, has_prev, has_next)
-    await message.answer(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 @router.message(Command("allow"))
@@ -1565,7 +1566,7 @@ async def users_inline_router(cq: CallbackQuery):
             return await cq.answer()
 
         kb = users_list_kb(real_page, users, allowed_ids, has_prev, has_next)
-        await cq.message.edit_text(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        await cq.message.edit_text(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
         return await cq.answer()
 
     if action == "manage":
@@ -1825,7 +1826,7 @@ async def list_warehouses(message: Message):
     if not rows:
         return await message.answer("Складов пока нет. Добавь через ➕", reply_markup=warehouses_menu_kb())
     txt = "🏬 *Склады:*\n" + "\n".join([f"• {w.name}" for w in rows])
-    await message.answer(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=warehouses_menu_kb())
+    await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=warehouses_menu_kb())
 
 
 @router.message(ProductsAdmin.adding)
@@ -1876,7 +1877,7 @@ async def list_products(message: Message):
     if not rows:
         return await message.answer("Товаров пока нет. Добавь через ➕", reply_markup=products_menu_kb())
     txt = "🧺 *Товары:*\n" + "\n".join([f"• {p.name}" for p in rows])
-    await message.answer(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=products_menu_kb())
+    await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=products_menu_kb())
 
 
 @router.message(BanksAdmin.adding)
@@ -1927,7 +1928,7 @@ async def list_banks(message: Message):
     if not rows:
         return await message.answer("Банков пока нет. Добавь через ➕", reply_markup=banks_menu_kb())
     txt = "🏦 *Банки:*\n" + "\n".join([f"• {b.name}" for b in rows])
-    await message.answer(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=banks_menu_kb())
+    await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=banks_menu_kb())
 
 
 SALE_FLOW = [
@@ -2002,7 +2003,7 @@ async def sale_prompt(message: Message, state: FSMContext):
     if step == "confirm":
         data = await state.get_data()
         await message.answer(build_sale_summary(data) + "\n\nПодтвердить?",
-                             parse_mode=ParseMode.MARKDOWN,
+                             parse_mode=ParseMode.HTML,
                              reply_markup=yes_no_kb("sale_confirm"))
         return
 
@@ -2561,7 +2562,7 @@ async def income_prompt(message: Message, state: FSMContext):
     if step == "confirm":
         data = await state.get_data()
         await message.answer(build_income_summary(data) + "\n\nПодтвердить?",
-                             parse_mode=ParseMode.MARKDOWN,
+                             parse_mode=ParseMode.HTML,
                              reply_markup=yes_no_kb("inc_confirm"))
         return
 
@@ -3089,7 +3090,7 @@ async def deb_nav_handler(cq: CallbackQuery, state: FSMContext):
             await state.set_state(DebtorWizard.confirm)
             data = await state.get_data()
             await cq.message.answer(build_debtor_summary(data) + "\n\nПодтвердить?",
-                                   parse_mode=ParseMode.MARKDOWN,
+                                   parse_mode=ParseMode.HTML,
                                    reply_markup=yes_no_kb("deb_confirm"))
         return await cq.answer()
 
@@ -3165,7 +3166,7 @@ async def deb_delivery(message: Message, state: FSMContext):
     await state.set_state(DebtorWizard.confirm)
     data = await state.get_data()
     await message.answer(build_debtor_summary(data) + "\n\nПодтвердить?",
-                         parse_mode=ParseMode.MARKDOWN,
+                         parse_mode=ParseMode.HTML,
                          reply_markup=yes_no_kb("deb_confirm"))
 
 
