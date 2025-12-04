@@ -32,32 +32,25 @@ if not TOKEN:
 
 DB_URL = os.getenv("DB_URL", "sqlite+aiosqlite:////var/data/data.db")
 
+OWNER_ID = int(os.getenv("OWNER_ID", "139099578") or 0)
+
 ADMIN_USER_IDS = set(
     int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",")
     if x.strip().isdigit()
 )
 
-OWNER_ID = int(os.getenv("OWNER_ID", "139099578") or 0)  # владелец бота
-print("OWNER_ID:", OWNER_ID, flush=True)
+# OWNER is always allowed (even if ADMIN_USER_IDS is empty/misconfigured)
+ADMIN_USER_IDS.add(OWNER_ID)
+
 print("=== BOOT ===", flush=True)
 print("TOKEN set:", bool(TOKEN), flush=True)
 print("DB_URL:", DB_URL, flush=True)
+print("OWNER_ID:", OWNER_ID, flush=True)
 
 
 # ===================== DB models =====================
 class Base(DeclarativeBase):
     pass
-
-
-
-class AllowedUser(Base):
-    __tablename__ = "allowed_users"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
-    # совместимость: у кого-то колонка могла называться created_at, у кого-то added_at.
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
-    added_by: Mapped[int] = mapped_column(Integer, default=0)
-    note: Mapped[str] = mapped_column(String(200), default="")
 
 
 class Warehouse(Base):
@@ -182,73 +175,76 @@ class Debtor(Base):
     is_paid: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
-engine = create_async_engine(DB_URL, echo=False)
-Session = async_sessionmaker(engine, expire_on_commit=False)
+class AllowedUser(Base):
+    __tablename__ = "allowed_users"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
 
-async def ensure_allowed_users_schema():
-    """Лёгкая миграция SQLite без Alembic: создаём таблицу allowed_users и добавляем недостающие колонки.
-    Также делаем алиас created_at/added_at для старых версий.
+    # unified timestamp column (we'll migrate older schemas that used added_at)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        server_default=func.current_timestamp(),
+        index=True,
+        nullable=False,
+    )
+
+    added_by: Mapped[int] = mapped_column(Integer, default=0)
+    note: Mapped[str] = mapped_column(String(200), default="")
+
+
+
+
+# ===================== Light migrations (SQLite) =====================
+async def ensure_allowed_users_schema(conn):
     """
-    async with engine.begin() as conn:
-        # Есть ли таблица?
-        row = await conn.exec_driver_sql(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='allowed_users'"
+    Делает таблицу allowed_users совместимой с любыми прошлыми версиями.
+    Поддерживаем 2 варианта:
+      - старая схема: added_at
+      - новая схема: created_at (NOT NULL)
+    """
+    # 1) создаём таблицу (если её нет) сразу по "новой" схеме
+    await conn.exec_driver_sql(
+        """
+        CREATE TABLE IF NOT EXISTS allowed_users (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL UNIQUE,
+            created_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            added_by INTEGER NOT NULL DEFAULT 0,
+            note VARCHAR(200) NOT NULL DEFAULT ''
         )
-        exists = row.first() is not None
+        """
+    )
 
-        if not exists:
-            await conn.exec_driver_sql(
-                """
-                CREATE TABLE allowed_users (
-                    id INTEGER PRIMARY KEY,
-                    user_id INTEGER NOT NULL UNIQUE,
-                    created_at DATETIME NOT NULL,
-                    added_by INTEGER NOT NULL DEFAULT 0,
-                    note VARCHAR(200) NOT NULL DEFAULT ''
-                )
-                """
-            )
-            await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_allowed_users_user_id ON allowed_users (user_id)")
-            await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_allowed_users_created_at ON allowed_users (created_at)")
-            return
+    # 2) смотрим какие колонки реально есть
+    cols = await conn.exec_driver_sql("PRAGMA table_info(allowed_users)")
+    cols = [r[1] for r in cols.fetchall()]  # name is 2nd field
 
-        # Проверяем текущие колонки
-        cols_res = await conn.exec_driver_sql("PRAGMA table_info('allowed_users')")
-        cols = {r[1] for r in cols_res.fetchall()}
+    # 3) если есть added_at и нет created_at — добавляем created_at и переносим данные
+    if ("created_at" not in cols) and ("added_at" in cols):
+        await conn.exec_driver_sql("ALTER TABLE allowed_users ADD COLUMN created_at DATETIME")
+        # переносим: created_at = added_at, если оно не NULL, иначе current timestamp
+        await conn.exec_driver_sql(
+            "UPDATE allowed_users SET created_at = COALESCE(added_at, CURRENT_TIMESTAMP) WHERE created_at IS NULL"
+        )
 
-        # Если старая колонка added_at есть, а created_at нет — добавим created_at и заполним из added_at
-        if "created_at" not in cols:
-            await conn.exec_driver_sql("ALTER TABLE allowed_users ADD COLUMN created_at DATETIME")
-            # заполним значением added_at или текущим временем
-            if "added_at" in cols:
-                await conn.exec_driver_sql("UPDATE allowed_users SET created_at = COALESCE(created_at, added_at)")
-            await conn.exec_driver_sql("UPDATE allowed_users SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)")
-            # В SQLite нельзя легко сделать NOT NULL через ALTER, поэтому просто гарантируем заполненность.
+    # 4) если нет added_by / note — добавляем
+    if "added_by" not in cols:
+        await conn.exec_driver_sql("ALTER TABLE allowed_users ADD COLUMN added_by INTEGER NOT NULL DEFAULT 0")
+    if "note" not in cols:
+        await conn.exec_driver_sql("ALTER TABLE allowed_users ADD COLUMN note VARCHAR(200) NOT NULL DEFAULT ''")
 
-        # Если колонка added_at отсутствует — ничего страшного, мы используем created_at.
-        if "added_by" not in cols:
-            await conn.exec_driver_sql("ALTER TABLE allowed_users ADD COLUMN added_by INTEGER NOT NULL DEFAULT 0")
-        if "note" not in cols:
-            await conn.exec_driver_sql("ALTER TABLE allowed_users ADD COLUMN note VARCHAR(200) NOT NULL DEFAULT ''")
-
-        await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_allowed_users_user_id ON allowed_users (user_id)")
-        await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_allowed_users_created_at ON allowed_users (created_at)")
+    # 5) если created_at всё ещё NULL где-то — заполним (на всякий случай)
+    await conn.exec_driver_sql(
+        "UPDATE allowed_users SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP) WHERE created_at IS NULL"
+    )
 
 
-
-
-# ===================== Helpers =====================
-
-ALLOWED_CACHE: set[int] = set()
-def is_admin(user_id: int) -> bool:
-    # Владелец всегда имеет доступ
-    if user_id == OWNER_ID:
+async def is_allowed(user_id: int) -> bool:
+    if int(user_id) == int(OWNER_ID):
         return True
-    # Если явно задан ADMIN_USER_IDS (старый режим) — тоже допускаем
-    if ADMIN_USER_IDS and user_id in ADMIN_USER_IDS:
-        return True
-    # Новый режим: список разрешённых в БД (кешируем в памяти)
-    return user_id in ALLOWED_CACHE
+    async with Session() as s:
+        return bool(await s.scalar(select(AllowedUser.id).where(AllowedUser.user_id == int(user_id))))
 
 
 
@@ -285,94 +281,6 @@ def parse_cb(data: str, prefix: str):
     return rest.split(":") if rest else []
 
 
-
-PENDING_REQUESTS: set[int] = set()
-
-async def refresh_allowed_cache():
-    global ALLOWED_CACHE
-    async with Session() as s:
-        ids = (await s.execute(select(AllowedUser.user_id))).scalars().all()
-    ALLOWED_CACHE = set(int(x) for x in ids if x is not None) | ({OWNER_ID} if OWNER_ID else set()) | set(ADMIN_USER_IDS or [])
-
-async def ensure_owner_allowed():
-    if not OWNER_ID:
-        return
-    async with Session() as s:
-        exists = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == OWNER_ID))
-        if not exists:
-            s.add(AllowedUser(user_id=OWNER_ID, created_at=datetime.utcnow(), added_by=OWNER_ID, note="owner"))
-            await s.commit()
-
-async def deny_access_message(message: Message):
-    """Сообщение пользователю + запрос владельцу."""
-    uid = message.from_user.id
-    if uid in PENDING_REQUESTS:
-        return await message.answer("⛔ У вас нет доступа. Запрос уже отправлен владельцу.")
-    PENDING_REQUESTS.add(uid)
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Разрешить", callback_data=f"acc_req:allow:{uid}")
-    kb.button(text="❌ Запретить", callback_data=f"acc_req:deny:{uid}")
-    kb.adjust(2)
-
-    await message.answer("⛔ У вас нет доступа. Запрос отправлен владельцу.")
-
-    # Важно: чтобы уведомление точно дошло, формируем текст без 'if ... else' внутри f-string
-    full_name = safe_text(message.from_user.full_name)
-    username = message.from_user.username
-    uline = f"@{username}" if username else "(нет)"
-    txt = (
-        "🔐 Запрос доступа к боту\n"
-        f"ID: {uid}\n"
-        f"Имя: {full_name}\n"
-        f"Юзернейм: {uline}"
-    )
-    try:
-        await message.bot.send_message(OWNER_ID, txt, reply_markup=kb.as_markup())
-    except Exception:
-        pass
-
-@router.message(Command("id"))
-async def cmd_id(message: Message):
-    await message.answer(f"Ваш Telegram ID: {message.from_user.id}")
-
-@router.callback_query(F.data.startswith("acc_req:"))
-async def cb_access_request(cq: CallbackQuery):
-    # Только владелец может нажимать
-    if cq.from_user.id != OWNER_ID:
-        return await cq.answer("Нет доступа", show_alert=True)
-
-    parts = (cq.data or "").split(":")
-    if len(parts) != 3:
-        return await cq.answer("Ошибка", show_alert=True)
-    action, uid_s = parts[1], parts[2]
-    if not uid_s.isdigit():
-        return await cq.answer("Ошибка ID", show_alert=True)
-    uid = int(uid_s)
-
-    if action == "allow":
-        async with Session() as s:
-            exists = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == uid))
-            if not exists:
-                s.add(AllowedUser(user_id=uid, created_at=datetime.utcnow(), added_by=OWNER_ID, note="approved"))
-                await s.commit()
-        await refresh_allowed_cache()
-        PENDING_REQUESTS.discard(uid)
-        try:
-            await cq.message.bot.send_message(uid, "✅ Доступ к боту разрешён. Напиши /start")
-        except Exception:
-            pass
-        await cq.message.edit_text(f"✅ Разрешил доступ пользователю {uid}")
-        return await cq.answer("Ок")
-
-    if action == "deny":
-        PENDING_REQUESTS.discard(uid)
-        await cq.message.edit_text(f"❌ Отказано пользователю {uid}")
-        return await cq.answer("Ок")
-
-    await cq.answer()
-
-
 # ===================== Menus =====================
 def main_menu_kb():
     kb = ReplyKeyboardBuilder()
@@ -401,10 +309,6 @@ def main_menu_kb():
     kb.adjust(2)
 
     kb.button(text="🏦 Банки")
-
-    kb.button(text="👥 Пользователи")
-    kb.button(text="📥 Скачать БД")
-    kb.adjust(2)
     kb.adjust(1)
 
     kb.button(text="❌ Отмена")
@@ -621,7 +525,6 @@ MENU_TEXTS = {
     "📥 Выгрузка (таблица)",  # NEW
     "📋 Должники", "➕ Добавить должн...",
     "🏬 Склады", "🧺 Товары", "🏦 Банки",
-    "👥 Пользователи", "📥 Скачать БД",
     "❌ Отмена",
     "➕ Добавить склад", "📃 Список складов", "🗑 Удалить склад",
     "➕ Добавить товар", "📃 Список товаров", "🗑 Удалить товар",
@@ -701,8 +604,8 @@ async def pick_bank_kb(prefix: str):
 # ===================== Menu handler =====================
 @router.message(F.text.in_(MENU_TEXTS))
 async def menu_anywhere(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return await deny_access_message(message)
+    if not (await is_allowed(message.from_user.id)):
+        return await message.answer("Нет доступа.")
 
     text = message.text
 
@@ -763,15 +666,6 @@ async def menu_anywhere(message: Message, state: FSMContext):
         await state.clear()
         return await message.answer("Управление банками:", reply_markup=banks_menu_kb())
 
-
-    if text == "👥 Пользователи":
-        await state.clear()
-        return await users_menu(message)
-
-    if text == "📥 Скачать БД":
-        await state.clear()
-        return await send_db_backup(message)
-
     # warehouses admin actions
     if text == "➕ Добавить склад":
         await state.clear()
@@ -820,11 +714,74 @@ async def menu_anywhere(message: Message, state: FSMContext):
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return await message.answer("Нет доступа.")
     await state.clear()
-    await message.answer("Привет! Выбери действие:", reply_markup=main_menu_kb())
 
+    uid = message.from_user.id
+    if await is_allowed(uid):
+        return await message.answer("Привет! Выбери действие:", reply_markup=main_menu_kb())
+
+    # запрос доступа владельцу
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Разрешить", callback_data=f"acc_req:allow:{uid}")
+    kb.button(text="❌ Запретить", callback_data=f"acc_req:deny:{uid}")
+    kb.adjust(2)
+
+    await message.answer("⛔ У вас нет доступа. Запрос отправлен владельцу.")
+    try:
+        username = f"@{message.from_user.username}" if message.from_user.username else "(нет)"
+        text = (
+            "🔐 Запрос доступа к боту\n"
+            f"ID: {uid}\n"
+            f"Имя: {safe_text(message.from_user.full_name)}\n"
+            f"Юзернейм: {username}"
+        )
+        await message.bot.send_message(
+            OWNER_ID,
+            text,
+            reply_markup=kb.as_markup()
+        )
+    except Exception:
+        pass
+
+
+
+
+
+
+# ===================== Access control =====================
+@router.callback_query(F.data.startswith("acc_req:"))
+async def cb_access_req(cq: CallbackQuery):
+    # only owner can press
+    if cq.from_user.id != OWNER_ID:
+        return await cq.answer("Нет доступа", show_alert=True)
+
+    parts = (cq.data or "").split(":")
+    if len(parts) != 3:
+        return await cq.answer("Ошибка", show_alert=True)
+    _, action, uid_s = parts
+    if not uid_s.isdigit():
+        return await cq.answer("Ошибка", show_alert=True)
+    uid = int(uid_s)
+
+    async with Session() as s:
+        exists = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == uid))
+        if action == "allow":
+            if not exists:
+                s.add(AllowedUser(user_id=uid, created_at=datetime.utcnow(), added_by=OWNER_ID, note="approved"))
+                await s.commit()
+            await cq.message.edit_text(f"✅ Доступ разрешён пользователю {uid}")
+            try:
+                await cq.bot.send_message(uid, "✅ Вам выдан доступ к боту. Напишите /start")
+            except Exception:
+                pass
+            return await cq.answer("Ок")
+        else:
+            await cq.message.edit_text(f"❌ Доступ отклонён пользователю {uid}")
+            try:
+                await cq.bot.send_message(uid, "⛔ Доступ к боту не выдан.")
+            except Exception:
+                pass
+            return await cq.answer("Ок")
 
 # ===================== Warehouses Admin =====================
 @router.message(WarehousesAdmin.adding)
@@ -1576,62 +1533,6 @@ async def debtor_by_id(message: Message):
     )
     await message.answer(txt, parse_mode=ParseMode.MARKDOWN,
                          reply_markup=debtor_actions_kb(r.id, r.is_paid))
-
-
-
-async def users_menu(message: Message):
-    if message.from_user.id != OWNER_ID:
-        return await message.answer("Только владелец может управлять пользователями.")
-    await refresh_allowed_cache()
-    cnt = len(ALLOWED_CACHE)
-    txt = (
-        "👥 *Пользователи доступа*\n"
-        f"Всего разрешено: *{cnt}*\n\n"
-        "Команды:\n"
-        "• `пользователи` — список\n"
-        "• `добавить 123456789` — разрешить\n"
-        "• `удалить 123456789` — запретить"
-    )
-    await message.answer(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb())
-
-@router.message(F.text.regexp(r"(?i)^пользователи$"))
-async def users_list_cmd(message: Message):
-    if message.from_user.id != OWNER_ID:
-        return await deny_access_message(message) if not is_admin(message.from_user.id) else await message.answer("Нет доступа.")
-    async with Session() as s:
-        rows = (await s.execute(select(AllowedUser).order_by(AllowedUser.created_at.desc()).limit(200))).scalars().all()
-    if not rows:
-        return await message.answer("Пока никого нет (кроме владельца).")
-    lines = ["👥 Разрешённые (последние 200):"]
-    for r in rows:
-        lines.append(f"• {r.user_id} — {r.note or ''}")
-    await message.answer("\n".join(lines))
-
-@router.message(F.text.regexp(r"(?i)^добавить\s+\d+$"))
-async def users_add_cmd(message: Message):
-    if message.from_user.id != OWNER_ID:
-        return await message.answer("Только владелец.")
-    uid = int(message.text.split()[-1])
-    async with Session() as s:
-        exists = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == uid))
-        if not exists:
-            s.add(AllowedUser(user_id=uid, created_at=datetime.utcnow(), added_by=OWNER_ID, note="manual"))
-            await s.commit()
-    await refresh_allowed_cache()
-    await message.answer(f"✅ Разрешил {uid}")
-
-@router.message(F.text.regexp(r"(?i)^удалить\s+\d+$"))
-async def users_del_cmd(message: Message):
-    if message.from_user.id != OWNER_ID:
-        return await message.answer("Только владелец.")
-    uid = int(message.text.split()[-1])
-    if uid == OWNER_ID:
-        return await message.answer("Нельзя удалить владельца 🙂")
-    async with Session() as s:
-        await s.execute(delete(AllowedUser).where(AllowedUser.user_id == uid))
-        await s.commit()
-    await refresh_allowed_cache()
-    await message.answer(f"🗑 Удалил доступ {uid}")
 
 
 # ===================== SALE wizard =====================
@@ -2947,17 +2848,19 @@ async def deb_confirm(cq: CallbackQuery, state: FSMContext):
 async def main():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # migrations for allowed_users table / columns
+        await ensure_allowed_users_schema(conn)
 
-    await ensure_allowed_users_schema()
-    await ensure_owner_allowed()
-    await refresh_allowed_cache()
+    # ensure owner is in allowed_users (optional but useful for listing)
+    async with Session() as s:
+        exists = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == OWNER_ID))
+        if not exists:
+            s.add(AllowedUser(user_id=OWNER_ID, created_at=datetime.utcnow(), added_by=OWNER_ID, note="owner"))
+            await s.commit()
 
     bot = Bot(TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-
-    # ежедневный бэкап
-    asyncio.create_task(backup_scheduler(bot))
 
     await bot.delete_webhook(drop_pending_updates=True)
     print("=== BOT STARTED OK ===", flush=True)
@@ -2967,48 +2870,5 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
 
-def _db_file_path() -> str:
-    # DB_URL looks like sqlite+aiosqlite:////var/data/data.db
-    if DB_URL.startswith("sqlite+aiosqlite:////"):
-        return DB_URL.replace("sqlite+aiosqlite:////", "/")
-    if DB_URL.startswith("sqlite:////"):
-        return DB_URL.replace("sqlite:////", "/")
-    return "/var/data/data.db"
 
-async def send_db_backup(message_or_bot: Any):
-    """Отправить файл БД владельцу (в личку)."""
-    path = _db_file_path()
-    if not os.path.exists(path):
-        # иногда база лежит рядом, если локально
-        if os.path.exists("data.db"):
-            path = "data.db"
-        else:
-            if isinstance(message_or_bot, Message):
-                return await message_or_bot.answer("БД не найдена.")
-            return
-    try:
-        doc = FSInputFile(path)
-        caption = f"🗄 Бэкап БД ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
-        if isinstance(message_or_bot, Message):
-            # владельцу отправляем в личку, но если владелец жмёт кнопку — можно и тут
-            await message_or_bot.bot.send_document(OWNER_ID, doc, caption=caption)
-            return await message_or_bot.answer("✅ Отправил бэкап владельцу в личку.")
-        else:
-            await message_or_bot.send_document(OWNER_ID, doc, caption=caption)
-    except Exception:
-        if isinstance(message_or_bot, Message):
-            await message_or_bot.answer("Не удалось отправить бэкап.")
 
-async def backup_scheduler(bot: Bot):
-    """Каждый день в 23:50 по времени Астаны отправляем БД владельцу."""
-    tz = ZoneInfo("Asia/Almaty")
-    while True:
-        now = datetime.now(tz)
-        target = datetime.combine(now.date(), time(23, 50), tzinfo=tz)
-        if now >= target:
-            target = target + timedelta(days=1)
-        sleep_s = (target - now).total_seconds()
-        await asyncio.sleep(sleep_s)
-        await send_db_backup(bot)
-        # небольшая пауза, чтобы не триггернуло дважды
-        await asyncio.sleep(2)
