@@ -1923,8 +1923,8 @@ async def guard_menu_during_flow(message: Message, state: FSMContext):
         return  # это обычный ввод значения, пусть обработают state-хендлеры ниже
     cur = await state.get_state()
     await message.answer(
-    await message.answer(
         f"Сейчас идёт заполнение.\nТекущий шаг: <b>{h(cur)}</b>\n\nСначала завершите ввод или нажмите отмену.",
+        reply_markup=interrupt_kb(),
     )
 
 @router.message(StateFilter(None), F.text)
@@ -3511,6 +3511,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
 
 
