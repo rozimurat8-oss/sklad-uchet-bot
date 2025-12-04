@@ -691,6 +691,13 @@ PR_BTNS = {BTN["pr_add"], BTN["pr_list"], BTN["pr_del"], BTN["back_reports"]}
 BK_BTNS = {BTN["bk_add"], BTN["bk_list"], BTN["bk_del"], BTN["back_reports"]}
 
 
+ALL_BTNS = set(BTN.values())
+
+def is_menu_button(t: str) -> bool:
+    return (t or "").strip() in ALL_BTNS
+
+
+
 async def allow_user(user_id: int, added_by: int, note: str = "approved"):
     async with Session() as s:
         exists = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == int(user_id)))
@@ -1876,6 +1883,53 @@ async def start_debtor(message: Message, state: FSMContext):
     await state.set_state(DebtorWizard.doc_date)
     await message.answer("Дата (для должника):", reply_markup=choose_date_kb("deb"))
 
+
+def interrupt_kb() -> ReplyKeyboardMarkup:
+    buttons = [
+        [KeyboardButton(text="❌ Отмена"), KeyboardButton(text="↩️ Продолжить")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+
+@router.message(F.text == "❌ Отмена")
+async def cancel_any(message: Message, state: FSMContext):
+    await state.clear()
+    await set_menu(state, "main")
+    await message.answer("Ок, отменено.", reply_markup=main_menu_kb(is_admin=await is_owner(message.from_user.id)))
+
+@router.message(F.text == "↩️ Продолжить")
+async def continue_any(message: Message, state: FSMContext):
+    # Просто повторим подсказку текущего шага, если мы в мастере
+    cur = await state.get_state()
+    if not cur:
+        await set_menu(state, "main")
+        return await message.answer("Главное меню.", reply_markup=main_menu_kb(is_admin=await is_owner(message.from_user.id)))
+    # Попробуем вызвать существующие prompt-функции (sale_prompt / income_prompt / debtor_prompt)
+    try:
+        if "SaleWizard" in cur:
+            return await sale_prompt(message, state)
+        if "IncomeWizard" in cur:
+            return await income_prompt(message, state)
+        if "DebtorWizard" in cur:
+            return await debtor_prompt(message, state)
+    except Exception:
+        pass
+    return await message.answer("Продолжаем. Введите значение для текущего шага.", reply_markup=interrupt_kb())
+
+@router.message(~StateFilter(None), F.text)
+async def guard_menu_during_flow(message: Message, state: FSMContext):
+    # Если пользователь в процессе заполнения и нажал кнопку меню — предложим отменить или продолжить
+    t = (message.text or "").strip()
+    if not is_menu_button(t):
+        return  # это обычный ввод значения, пусть обработают state-хендлеры ниже
+    cur = await state.get_state()
+    await message.answer(
+        f"Сейчас идёт заполнение.
+Текущий шаг: <b>{h(cur)}</b>
+
+"
+        "Сначала завершите ввод или нажмите отмену.",
+        reply_markup=interrupt_kb(),
+    )
 
 @router.message(StateFilter(None), F.text)
 async def menu_router(message: Message, state: FSMContext):
