@@ -1855,8 +1855,6 @@ async def list_incomes(message: Message, state: FSMContext):
 
 
 
-@router.message(F.text.in_(MAIN_BTNS | REPORTS_BTNS | WH_BTNS | PR_BTNS | BK_BTNS))
-@router.message(F.text.in_(MAIN_BTNS | REPORTS_BTNS | WH_BTNS | PR_BTNS | BK_BTNS))
 
 async def start_debtor(message: Message, state: FSMContext):
     await state.clear()
