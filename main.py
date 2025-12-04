@@ -1674,8 +1674,6 @@ async def show_reports_menu(message: Message, state: FSMContext):
     await message.answer("Отчеты:", reply_markup=reports_menu_kb(is_owner(message.from_user.id)))
 
 
-@router.message(F.text.in_(MAIN_BTNS | REPORTS_BTNS | WH_BTNS | PR_BTNS | BK_BTNS))
-
 # --- Restored functions (income wizard + reports lists) ---
 
 async def income_go_to(state: FSMContext, step: str):
@@ -1839,6 +1837,8 @@ async def list_incomes(message: Message, state: FSMContext):
 
 
 
+@router.message(F.text.in_(MAIN_BTNS | REPORTS_BTNS | WH_BTNS | PR_BTNS | BK_BTNS))
+@router.message(F.text.in_(MAIN_BTNS | REPORTS_BTNS | WH_BTNS | PR_BTNS | BK_BTNS))
 async def menu_router(message: Message, state: FSMContext):
     uid = message.from_user.id
     await upsert_user_from_tg(message.from_user)
