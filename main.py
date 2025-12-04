@@ -31,7 +31,6 @@ if not TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
 DB_URL = os.getenv("DB_URL", "sqlite+aiosqlite:////var/data/data.db")
-# --- SQLAlchemy async engine/session ---
 engine = create_async_engine(DB_URL, echo=False)
 Session = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -41,8 +40,7 @@ ADMIN_USER_IDS = set(
     int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",")
     if x.strip().isdigit()
 )
-
-# OWNER is always allowed (even if ADMIN_USER_IDS is empty/misconfigured)
+# Owner always in admins set
 ADMIN_USER_IDS.add(OWNER_ID)
 
 print("=== BOOT ===", flush=True)
@@ -54,6 +52,23 @@ print("OWNER_ID:", OWNER_ID, flush=True)
 # ===================== DB models =====================
 class Base(DeclarativeBase):
     pass
+
+
+class User(Base):
+    __tablename__ = "users"
+    user_id: Mapped[int] = mapped_column(Integer, primary_key=True)  # tg id
+    full_name: Mapped[str] = mapped_column(String(200), default="")
+    username: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class AllowedUser(Base):
+    __tablename__ = "allowed_users"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    added_by: Mapped[int] = mapped_column(Integer, default=0)
+    note: Mapped[str] = mapped_column(String(300), default="")
 
 
 class Warehouse(Base):
@@ -178,25 +193,9 @@ class Debtor(Base):
     is_paid: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
-class AllowedUser(Base):
-    __tablename__ = "allowed_users"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
-    added_by: Mapped[int] = mapped_column(Integer, default=0)
-    note: Mapped[str] = mapped_column(String(300), default="")
-
-
-
 # ===================== Light migrations (SQLite) =====================
 async def ensure_allowed_users_schema(conn):
-    """
-    Мягкая миграция таблицы allowed_users под разные старые версии.
-    Делаем так, чтобы бот не падал при обновлениях схемы (SQLite).
-    """
     await conn.execute(text("PRAGMA foreign_keys=ON"))
-
-    # Создадим таблицу если её нет (новая схема)
     await conn.execute(text("""
         CREATE TABLE IF NOT EXISTS allowed_users (
             id INTEGER PRIMARY KEY,
@@ -206,55 +205,73 @@ async def ensure_allowed_users_schema(conn):
             note TEXT
         )
     """))
-
-    # Узнаём текущие колонки
     cols = (await conn.execute(text("PRAGMA table_info(allowed_users)"))).fetchall()
-    colnames = {c[1] for c in cols}  # c[1] = name
-    colinfo = {c[1]: c for c in cols}
+    colnames = {c[1] for c in cols}
 
-    # Старые версии могли иметь added_at вместо created_at
+    # Old: added_at -> created_at
     if "added_at" in colnames and "created_at" not in colnames:
         try:
             await conn.execute(text("ALTER TABLE allowed_users RENAME COLUMN added_at TO created_at"))
         except Exception:
-            # если SQLite старый или колонка уже переименована — игнор
             pass
-        # обновим метаданные
         cols = (await conn.execute(text("PRAGMA table_info(allowed_users)"))).fetchall()
         colnames = {c[1] for c in cols}
-        colinfo = {c[1]: c for c in cols}
 
-    # Добавим отсутствующие колонки
     if "added_by" not in colnames:
         await conn.execute(text("ALTER TABLE allowed_users ADD COLUMN added_by INTEGER"))
     if "note" not in colnames:
         await conn.execute(text("ALTER TABLE allowed_users ADD COLUMN note TEXT"))
 
-    # Если created_at есть, но в базе NOT NULL без default — будем всегда писать значение при INSERT.
-    # Также если вдруг created_at отсутствует, добавим (на очень старых базах).
     if "created_at" not in colnames:
         await conn.execute(text("ALTER TABLE allowed_users ADD COLUMN created_at DATETIME"))
-        # Попробуем проставить для существующих строк
         await conn.execute(text("UPDATE allowed_users SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)"))
-        # Примечание: сделать NOT NULL через ALTER в SQLite нельзя без пересоздания таблицы — и не нужно.
-
-    # Заполним пустые created_at (если есть нулевые/NULL записи)
     try:
         await conn.execute(text("UPDATE allowed_users SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP) WHERE created_at IS NULL"))
     except Exception:
         pass
+
+
+async def ensure_users_schema(conn):
+    await conn.execute(text("PRAGMA foreign_keys=ON"))
+    await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            full_name TEXT,
+            username TEXT,
+            created_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+        )
+    """))
+
+    cols = (await conn.execute(text("PRAGMA table_info(users)"))).fetchall()
+    colnames = {c[1] for c in cols}
+
+    if "full_name" not in colnames:
+        await conn.execute(text("ALTER TABLE users ADD COLUMN full_name TEXT"))
+    if "username" not in colnames:
+        await conn.execute(text("ALTER TABLE users ADD COLUMN username TEXT"))
+    if "created_at" not in colnames:
+        await conn.execute(text("ALTER TABLE users ADD COLUMN created_at DATETIME"))
+        await conn.execute(text("UPDATE users SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)"))
+    try:
+        await conn.execute(text("UPDATE users SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP) WHERE created_at IS NULL"))
+    except Exception:
+        pass
+
+
 # ===================== Helpers =====================
-def is_admin(user_id: int) -> bool:
-    # Owner always allowed. Others must be in AllowedUser.
+def is_owner(user_id: int) -> bool:
     return int(user_id) == int(OWNER_ID)
 
 
+def is_admin(user_id: int) -> bool:
+    return int(user_id) in ADMIN_USER_IDS  # owner already inside
+
+
 async def is_allowed(user_id: int) -> bool:
-    if int(user_id) == int(OWNER_ID):
+    if is_owner(user_id):
         return True
     async with Session() as s:
         return bool(await s.scalar(select(AllowedUser.id).where(AllowedUser.user_id == int(user_id))))
-
 
 
 def dec(s: str) -> Decimal:
@@ -279,15 +296,56 @@ def safe_phone(s: str) -> str:
 
 
 def parse_cb(data: str, prefix: str):
-    """
-    Безопасный парсер callback_data.
-    Возвращает список частей ПОСЛЕ prefix.
-    Например: data="sale_pr:id:12", prefix="sale_pr" -> ["id","12"]
-    """
     if not data or not data.startswith(prefix + ":"):
         return []
-    rest = data[len(prefix) + 1 :]
+    rest = data[len(prefix) + 1:]
     return rest.split(":") if rest else []
+
+
+def pretty_user_line(u: User | None, allowed: bool, uid: int, tg_full: str, tg_username: str | None, created_at: datetime | None):
+    mark = "✅" if allowed else "⛔"
+    name = safe_text(u.full_name) if u else safe_text(tg_full)
+    if not name:
+        name = "-"
+    username = (u.username if u and u.username else tg_username) or "-"
+    if username and not username.startswith("@") and username != "-":
+        username = "@" + username
+    dt = created_at or (u.created_at if u else None)
+    dt_s = dt.strftime("%Y-%m-%d %H:%M") if dt else "-"
+    return f"{mark} {uid} | {name} | {username} | {dt_s}"
+
+
+async def upsert_user_from_tg(tg_user) -> User:
+    """Create user row if not exists; update username always; update full_name if empty."""
+    uid = int(tg_user.id)
+    full_tg = safe_text(getattr(tg_user, "full_name", "") or "")
+    uname = getattr(tg_user, "username", None)
+    async with Session() as s:
+        u = await s.get(User, uid)
+        if not u:
+            u = User(
+                user_id=uid,
+                full_name="",
+                username=uname,
+                created_at=datetime.utcnow(),
+            )
+            s.add(u)
+            await s.commit()
+            await s.refresh(u)
+        else:
+            changed = False
+            # keep username fresh
+            if uname != u.username:
+                u.username = uname
+                changed = True
+            # if stored full_name empty, set from Telegram
+            if (not safe_text(u.full_name)) and full_tg:
+                u.full_name = full_tg
+                changed = True
+            if changed:
+                await s.commit()
+                await s.refresh(u)
+        return u
 
 
 # ===================== Menus =====================
@@ -305,7 +363,6 @@ def main_menu_kb():
     kb.button(text="📄 Продажи")
     kb.adjust(2)
 
-    # NEW
     kb.button(text="📥 Выгрузка (таблица)")
     kb.adjust(1)
 
@@ -429,21 +486,21 @@ def cal_open_kb(scope: str, year: int, month: int):
     while len(cells) % 7 != 0:
         cells.append((" ", f"cal:{scope}:noop:{year:04d}-{month:02d}"))
 
-    for text, cb in cells:
-        ikb.button(text=text, callback_data=cb)
+    for t, cb in cells:
+        ikb.button(text=t, callback_data=cb)
 
     prev_y, prev_m = year, month - 1
     if prev_m == 0:
         prev_m = 12
         prev_y -= 1
-    next_y, next_m = year, month + 1
-    if next_m == 13:
-        next_m = 1
+    next_y, next_mo = year, month + 1
+    if next_mo == 13:
+        next_mo = 1
         next_y += 1
 
     ikb.button(text="◀️", callback_data=f"cal:{scope}:prev:{prev_y:04d}-{prev_m:02d}")
     ikb.button(text="Сегодня", callback_data=f"cal:{scope}:pick:{date.today().isoformat()}")
-    ikb.button(text="▶️", callback_data=f"cal:{scope}:next:{next_y:04d}-{next_m:02d}")
+    ikb.button(text="▶️", callback_data=f"cal:{scope}:next:{next_y:04d}-{next_mo:02d}")
 
     rows = 1 + 1 + (len(cells) // 7) + 1
     ikb.adjust(1, 7, *([7] * (rows - 3)), 3)
@@ -458,6 +515,10 @@ def choose_date_kb(scope: str):
 
 
 # ===================== FSM =====================
+class ProfileWizard(StatesGroup):
+    enter_name = State()
+
+
 class SaleWizard(StatesGroup):
     doc_date = State()
     customer_name = State()
@@ -530,8 +591,7 @@ router = Router()
 
 MENU_TEXTS = {
     "📦 Остатки", "💰 Деньги", "🟢 Приход", "🔴 Продажа",
-    "📄 Приходы", "📄 Продажи",
-    "📥 Выгрузка (таблица)",  # NEW
+    "📄 Приходы", "📄 Продажи", "📥 Выгрузка (таблица)",
     "📋 Должники", "➕ Добавить должн...",
     "🏬 Склады", "🧺 Товары", "🏦 Банки",
     "❌ Отмена",
@@ -610,126 +670,120 @@ async def pick_bank_kb(prefix: str):
     return ikb.as_markup()
 
 
-# ===================== Menu handler =====================
-@router.message(F.text.in_(MENU_TEXTS))
-async def menu_anywhere(message: Message, state: FSMContext):
-    if not (await is_allowed(message.from_user.id)):
-        return await message.answer("Нет доступа.")
+# ===================== PROFILE / USERS =====================
+@router.message(Command("users"))
+async def cmd_users(message: Message):
+    if not is_owner(message.from_user.id):
+        return await message.answer("Команда доступна только владельцу.")
 
-    text = message.text
+    async with Session() as s:
+        users = (await s.execute(select(User).order_by(User.created_at.desc()).limit(200))).scalars().all()
+        allowed_ids = set((await s.execute(select(AllowedUser.user_id))).scalars().all())
 
-    if text == "❌ Отмена":
-        await state.clear()
-        return await message.answer("Ок, отменил ✅", reply_markup=main_menu_kb())
+    if not users:
+        return await message.answer("Список пользователей пуст.")
 
-    if text == "⬅️ Назад в меню":
-        await state.clear()
-        return await message.answer("Меню:", reply_markup=main_menu_kb())
+    header = "Статус | user_id | full_name | username | created_at"
+    lines = [header, "-" * len(header)]
+    for u in users:
+        allowed = u.user_id in allowed_ids or is_owner(u.user_id)
+        username = u.username or "-"
+        if username != "-" and not username.startswith("@"):
+            username = "@" + username
+        dt_s = u.created_at.strftime("%Y-%m-%d %H:%M") if u.created_at else "-"
+        mark = "✅" if allowed else "⛔"
+        nm = safe_text(u.full_name) or "-"
+        lines.append(f"{mark} | {u.user_id} | {nm} | {username} | {dt_s}")
 
-    if text == "📦 Остатки":
-        await state.clear()
-        return await show_stocks_table(message)
+    text_out = "<pre>" + "\n".join(lines[:80]) + "</pre>"
+    if len(lines) > 80:
+        text_out += "\n(Показаны первые 79 пользователей. Если надо — скажи, добавлю пагинацию.)"
+    await message.answer(text_out, parse_mode=ParseMode.HTML)
 
-    if text == "💰 Деньги":
-        await state.clear()
-        return await show_money(message)
 
-    if text == "🟢 Приход":
-        await state.clear()
-        return await start_income(message, state)
+@router.message(Command("allow"))
+async def cmd_allow(message: Message):
+    if not is_owner(message.from_user.id):
+        return await message.answer("Команда доступна только владельцу.")
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        return await message.answer("Использование: /allow <id>")
+    uid = int(parts[1])
 
-    if text == "🔴 Продажа":
-        await state.clear()
-        return await start_sale(message, state)
+    async with Session() as s:
+        # ensure user row
+        u = await s.get(User, uid)
+        if not u:
+            s.add(User(user_id=uid, full_name="", username=None, created_at=datetime.utcnow()))
+            await s.flush()
 
-    if text == "📄 Продажи":
-        await state.clear()
-        return await list_sales(message)
+        exists = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == uid))
+        if not exists:
+            s.add(AllowedUser(user_id=uid, created_at=datetime.utcnow(), added_by=OWNER_ID, note="manual /allow"))
+        await s.commit()
 
-    if text == "📄 Приходы":
-        await state.clear()
-        return await list_incomes(message)
+    await message.answer(f"✅ Доступ разрешён пользователю {uid}")
+    try:
+        await message.bot.send_message(uid, "✅ Вам выдан доступ к боту. Напишите /start")
+    except Exception:
+        pass
 
-    # NEW
-    if text == "📥 Выгрузка (таблица)":
-        await state.clear()
-        return await export_menu(message)
 
-    if text == "📋 Должники":
-        await state.clear()
-        return await list_debtors(message)
+@router.message(Command("deny"))
+async def cmd_deny(message: Message):
+    if not is_owner(message.from_user.id):
+        return await message.answer("Команда доступна только владельцу.")
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        return await message.answer("Использование: /deny <id>")
+    uid = int(parts[1])
+    if is_owner(uid):
+        return await message.answer("Нельзя запретить владельца 🙂")
 
-    if text == "➕ Добавить должн...":
-        await state.clear()
-        return await start_debtor(message, state)
+    async with Session() as s:
+        await s.execute(delete(AllowedUser).where(AllowedUser.user_id == uid))
+        await s.commit()
 
-    if text == "🏬 Склады":
-        await state.clear()
-        return await message.answer("Управление складами:", reply_markup=warehouses_menu_kb())
+    await message.answer(f"⛔ Доступ запрещён пользователю {uid}")
 
-    if text == "🧺 Товары":
-        await state.clear()
-        return await message.answer("Управление товарами:", reply_markup=products_menu_kb())
 
-    if text == "🏦 Банки":
-        await state.clear()
-        return await message.answer("Управление банками:", reply_markup=banks_menu_kb())
+@router.message(Command("rmuser"))
+async def cmd_rmuser(message: Message):
+    if not is_owner(message.from_user.id):
+        return await message.answer("Команда доступна только владельцу.")
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        return await message.answer("Использование: /rmuser <id>")
+    uid = int(parts[1])
+    if is_owner(uid):
+        return await message.answer("Нельзя удалить владельца 🙂")
 
-    # warehouses admin actions
-    if text == "➕ Добавить склад":
-        await state.clear()
-        await state.set_state(WarehousesAdmin.adding)
-        return await message.answer("Напиши название склада:", reply_markup=warehouses_menu_kb())
+    async with Session() as s:
+        await s.execute(delete(AllowedUser).where(AllowedUser.user_id == uid))
+        await s.execute(delete(User).where(User.user_id == uid))
+        await s.commit()
 
-    if text == "📃 Список складов":
-        await state.clear()
-        return await list_warehouses(message)
-
-    if text == "🗑 Удалить склад":
-        await state.clear()
-        await state.set_state(WarehousesAdmin.deleting)
-        return await message.answer("Напиши EXACT название склада для удаления:", reply_markup=warehouses_menu_kb())
-
-    # products admin actions
-    if text == "➕ Добавить товар":
-        await state.clear()
-        await state.set_state(ProductsAdmin.adding)
-        return await message.answer("Напиши название товара:", reply_markup=products_menu_kb())
-
-    if text == "📃 Список товаров":
-        await state.clear()
-        return await list_products(message)
-
-    if text == "🗑 Удалить товар":
-        await state.clear()
-        await state.set_state(ProductsAdmin.deleting)
-        return await message.answer("Напиши EXACT название товара для удаления:", reply_markup=products_menu_kb())
-
-    # banks admin actions
-    if text == "➕ Добавить банк":
-        await state.clear()
-        await state.set_state(BanksAdmin.adding)
-        return await message.answer("Напиши название банка:", reply_markup=banks_menu_kb())
-
-    if text == "📃 Список банков":
-        await state.clear()
-        return await list_banks(message)
-
-    if text == "🗑 Удалить банк":
-        await state.clear()
-        await state.set_state(BanksAdmin.deleting)
-        return await message.answer("Напиши EXACT название банка для удаления:", reply_markup=banks_menu_kb())
+    await message.answer(f"🗑 Пользователь {uid} удалён из users (и доступ тоже снят, если был).")
 
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
 
+    # Always upsert user (even without access)
+    u = await upsert_user_from_tg(message.from_user)
+
+    # If user has no name stored -> ask to enter
+    if not safe_text(u.full_name):
+        await state.set_state(ProfileWizard.enter_name)
+        await message.answer("Привет! Напиши своё имя (как записать в базе):")
+        return
+
     uid = message.from_user.id
     if await is_allowed(uid):
         return await message.answer("Привет! Выбери действие:", reply_markup=main_menu_kb())
 
-    # запрос доступа владельцу
+    # No access -> send request to owner
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Разрешить", callback_data=f"acc_req:allow:{uid}")
     kb.button(text="❌ Запретить", callback_data=f"acc_req:deny:{uid}")
@@ -738,30 +792,54 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer("⛔ У вас нет доступа. Запрос отправлен владельцу.")
     try:
         username = f"@{message.from_user.username}" if message.from_user.username else "(нет)"
-        text = (
+        tg_full = safe_text(message.from_user.full_name)
+        text_req = (
             "🔐 Запрос доступа к боту\n"
             f"ID: {uid}\n"
-            f"Имя: {safe_text(message.from_user.full_name)}\n"
+            f"Имя TG: {tg_full}\n"
+            f"Имя в базе: {safe_text(u.full_name) or '-'}\n"
             f"Юзернейм: {username}"
         )
         await message.bot.send_message(
             OWNER_ID,
-            text,
+            text_req,
             reply_markup=kb.as_markup()
         )
     except Exception:
         pass
 
 
+@router.message(ProfileWizard.enter_name)
+async def profile_enter_name(message: Message, state: FSMContext):
+    name = safe_text(message.text)
+    if not name or len(name) < 2:
+        return await message.answer("Имя слишком короткое. Напиши, пожалуйста, нормальное имя 🙂")
+
+    uid = int(message.from_user.id)
+    async with Session() as s:
+        u = await s.get(User, uid)
+        if not u:
+            u = User(user_id=uid, full_name=name, username=message.from_user.username, created_at=datetime.utcnow())
+            s.add(u)
+        else:
+            u.full_name = name
+            # refresh username too
+            u.username = message.from_user.username
+        await s.commit()
+
+    await state.clear()
+
+    # continue start flow
+    if await is_allowed(uid):
+        return await message.answer(f"✅ Сохранил имя: {name}\n\nВыбери действие:", reply_markup=main_menu_kb())
+
+    await message.answer(f"✅ Сохранил имя: {name}\n\n⛔ Доступа пока нет. Напишите /start — запрос уйдёт владельцу.")
 
 
-
-
-# ===================== Access control =====================
+# ===================== Access control callbacks =====================
 @router.callback_query(F.data.startswith("acc_req:"))
 async def cb_access_req(cq: CallbackQuery):
-    # only owner can press
-    if cq.from_user.id != OWNER_ID:
+    if not is_owner(cq.from_user.id):
         return await cq.answer("Нет доступа", show_alert=True)
 
     parts = (cq.data or "").split(":")
@@ -773,7 +851,14 @@ async def cb_access_req(cq: CallbackQuery):
     uid = int(uid_s)
 
     async with Session() as s:
+        # ensure user row exists even if never used /start properly
+        u = await s.get(User, uid)
+        if not u:
+            s.add(User(user_id=uid, full_name="", username=None, created_at=datetime.utcnow()))
+            await s.flush()
+
         exists = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == uid))
+
         if action == "allow":
             if not exists:
                 s.add(AllowedUser(user_id=uid, added_by=OWNER_ID, note="approved"))
@@ -785,12 +870,124 @@ async def cb_access_req(cq: CallbackQuery):
                 pass
             return await cq.answer("Ок")
         else:
+            # deny -> just do nothing in allowed_users
             await cq.message.edit_text(f"❌ Доступ отклонён пользователю {uid}")
             try:
                 await cq.bot.send_message(uid, "⛔ Доступ к боту не выдан.")
             except Exception:
                 pass
             return await cq.answer("Ок")
+
+
+# ===================== Menu handler =====================
+@router.message(F.text.in_(MENU_TEXTS))
+async def menu_anywhere(message: Message, state: FSMContext):
+    if not (await is_allowed(message.from_user.id)):
+        return await message.answer("Нет доступа.")
+
+    text_ = message.text
+
+    if text_ == "❌ Отмена":
+        await state.clear()
+        return await message.answer("Ок, отменил ✅", reply_markup=main_menu_kb())
+
+    if text_ == "⬅️ Назад в меню":
+        await state.clear()
+        return await message.answer("Меню:", reply_markup=main_menu_kb())
+
+    if text_ == "📦 Остатки":
+        await state.clear()
+        return await show_stocks_table(message)
+
+    if text_ == "💰 Деньги":
+        await state.clear()
+        return await show_money(message)
+
+    if text_ == "🟢 Приход":
+        await state.clear()
+        return await start_income(message, state)
+
+    if text_ == "🔴 Продажа":
+        await state.clear()
+        return await start_sale(message, state)
+
+    if text_ == "📄 Продажи":
+        await state.clear()
+        return await list_sales(message)
+
+    if text_ == "📄 Приходы":
+        await state.clear()
+        return await list_incomes(message)
+
+    if text_ == "📥 Выгрузка (таблица)":
+        await state.clear()
+        return await export_menu(message)
+
+    if text_ == "📋 Должники":
+        await state.clear()
+        return await list_debtors(message)
+
+    if text_ == "➕ Добавить должн...":
+        await state.clear()
+        return await start_debtor(message, state)
+
+    if text_ == "🏬 Склады":
+        await state.clear()
+        return await message.answer("Управление складами:", reply_markup=warehouses_menu_kb())
+
+    if text_ == "🧺 Товары":
+        await state.clear()
+        return await message.answer("Управление товарами:", reply_markup=products_menu_kb())
+
+    if text_ == "🏦 Банки":
+        await state.clear()
+        return await message.answer("Управление банками:", reply_markup=banks_menu_kb())
+
+    # warehouses admin actions
+    if text_ == "➕ Добавить склад":
+        await state.clear()
+        await state.set_state(WarehousesAdmin.adding)
+        return await message.answer("Напиши название склада:", reply_markup=warehouses_menu_kb())
+
+    if text_ == "📃 Список складов":
+        await state.clear()
+        return await list_warehouses(message)
+
+    if text_ == "🗑 Удалить склад":
+        await state.clear()
+        await state.set_state(WarehousesAdmin.deleting)
+        return await message.answer("Напиши EXACT название склада для удаления:", reply_markup=warehouses_menu_kb())
+
+    # products admin actions
+    if text_ == "➕ Добавить товар":
+        await state.clear()
+        await state.set_state(ProductsAdmin.adding)
+        return await message.answer("Напиши название товара:", reply_markup=products_menu_kb())
+
+    if text_ == "📃 Список товаров":
+        await state.clear()
+        return await list_products(message)
+
+    if text_ == "🗑 Удалить товар":
+        await state.clear()
+        await state.set_state(ProductsAdmin.deleting)
+        return await message.answer("Напиши EXACT название товара для удаления:", reply_markup=products_menu_kb())
+
+    # banks admin actions
+    if text_ == "➕ Добавить банк":
+        await state.clear()
+        await state.set_state(BanksAdmin.adding)
+        return await message.answer("Напиши название банка:", reply_markup=banks_menu_kb())
+
+    if text_ == "📃 Список банков":
+        await state.clear()
+        return await list_banks(message)
+
+    if text_ == "🗑 Удалить банк":
+        await state.clear()
+        await state.set_state(BanksAdmin.deleting)
+        return await message.answer("Напиши EXACT название банка для удаления:", reply_markup=banks_menu_kb())
+
 
 # ===================== Warehouses Admin =====================
 @router.message(WarehousesAdmin.adding)
@@ -1028,7 +1225,7 @@ async def show_money(message: Message):
 
 
 # ===================== EXPORT TABLES (CHAT) =====================
-EXPORT_PAGE_SIZE = 20  # безопасно для Telegram, можно менять
+EXPORT_PAGE_SIZE = 20
 
 
 def export_menu_kb():
@@ -1188,13 +1385,6 @@ async def export_sales_text(page: int):
 
 @router.callback_query(F.data.startswith("exp:"))
 async def export_router(cq: CallbackQuery):
-    """
-    exp:menu
-    exp:back
-    exp:stocks:0
-    exp:incomes:1
-    exp:sales:2
-    """
     parts = (cq.data or "").split(":")
     if len(parts) < 2:
         return await cq.answer()
@@ -1581,51 +1771,39 @@ async def sale_prompt(message: Message, state: FSMContext):
     if step == "doc_date":
         await message.answer("Дата продажи:", reply_markup=choose_date_kb("sale"))
         return
-
     if step == "customer_name":
         await message.answer("Имя клиента:", reply_markup=nav_kb("sale_nav:customer_name", allow_skip=True))
         return
-
     if step == "customer_phone":
         await message.answer("Телефон клиента:", reply_markup=nav_kb("sale_nav:customer_phone", allow_skip=True))
         return
-
     if step == "warehouse":
         await message.answer("Выбери склад:", reply_markup=await pick_warehouse_kb("sale_wh"))
         return
-
     if step == "product":
         await message.answer("Выбери товар:", reply_markup=await pick_product_kb("sale_pr"))
         return
-
     if step == "qty":
         await message.answer("Кол-во (кг), например 125.5:", reply_markup=nav_kb("sale_nav:qty", allow_skip=False))
         return
-
     if step == "price":
         await message.answer("Цена за 1 кг:", reply_markup=nav_kb("sale_nav:price", allow_skip=False))
         return
-
     if step == "delivery":
         await message.answer("Доставка (0 если нет):", reply_markup=nav_kb("sale_nav:delivery", allow_skip=True))
         return
-
     if step == "paid_status":
         await message.answer("Статус оплаты:", reply_markup=sale_status_kb())
         return
-
     if step == "pay_method":
         await message.answer("Как оплатили?", reply_markup=pay_method_kb("sale_pay"))
         return
-
     if step == "account_type":
         await message.answer("Куда поступили деньги?", reply_markup=account_type_kb("sale_acc"))
         return
-
     if step == "bank_pick":
         await message.answer("Выбери банк/счёт из списка:", reply_markup=await pick_bank_kb("sale_bank"))
         return
-
     if step == "confirm":
         data = await state.get_data()
         await message.answer(build_sale_summary(data) + "\n\nПодтвердить?",
@@ -1642,7 +1820,6 @@ async def start_sale(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("cal:sale:"))
 async def cal_sale_handler(cq: CallbackQuery, state: FSMContext):
-    # cal:sale:action:payload
     parts = (cq.data or "").split(":", 3)
     if len(parts) < 4:
         return await cq.answer()
@@ -1667,7 +1844,6 @@ async def cal_sale_handler(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("sale_nav:"))
 async def sale_nav_handler(cq: CallbackQuery, state: FSMContext):
-    # sale_nav:field:action
     parts = (cq.data or "").split(":", 2)
     if len(parts) < 3:
         return await cq.answer()
@@ -1727,7 +1903,6 @@ async def sale_choose_wh(cq: CallbackQuery, state: FSMContext):
         return await cq.answer()
 
     action = parts[0]
-
     if action == "back":
         await sale_go_to(state, "customer_phone")
         await sale_prompt(cq.message, state)
@@ -1770,7 +1945,6 @@ async def sale_choose_pr(cq: CallbackQuery, state: FSMContext):
         return await cq.answer()
 
     action = parts[0]
-
     if action == "back":
         await sale_go_to(state, "warehouse_id")
         await sale_prompt(cq.message, state)
@@ -1910,7 +2084,6 @@ async def sale_bank_pick(cq: CallbackQuery, state: FSMContext):
         return await cq.answer()
 
     action = parts[0]
-
     if action == "back":
         await sale_go_to(state, "account_type")
         await sale_prompt(cq.message, state)
@@ -2149,51 +2322,39 @@ async def income_prompt(message: Message, state: FSMContext):
     if step == "doc_date":
         await message.answer("Дата прихода:", reply_markup=choose_date_kb("inc"))
         return
-
     if step == "supplier_name":
         await message.answer("Имя поставщика:", reply_markup=nav_kb("inc_nav:supplier_name", allow_skip=True))
         return
-
     if step == "supplier_phone":
         await message.answer("Телефон поставщика:", reply_markup=nav_kb("inc_nav:supplier_phone", allow_skip=True))
         return
-
     if step == "warehouse":
         await message.answer("Выбери склад прихода:", reply_markup=await pick_warehouse_kb("inc_wh"))
         return
-
     if step == "product":
         await message.answer("Выбери товар:", reply_markup=await pick_product_kb("inc_pr"))
         return
-
     if step == "qty":
         await message.answer("Кол-во (кг):", reply_markup=nav_kb("inc_nav:qty", allow_skip=False))
         return
-
     if step == "price":
         await message.answer("Цена за 1 кг:", reply_markup=nav_kb("inc_nav:price", allow_skip=False))
         return
-
     if step == "delivery":
         await message.answer("Доставка (0 если нет):", reply_markup=nav_kb("inc_nav:delivery", allow_skip=True))
         return
-
     if step == "add_money":
         await message.answer("Добавить запись денег (расход) по этому приходу?", reply_markup=yes_no_kb("inc_money"))
         return
-
     if step == "pay_method":
         await message.answer("Как оплатили поставщику?", reply_markup=pay_method_kb("inc_pay"))
         return
-
     if step == "account_type":
         await message.answer("С какого счёта ушли деньги?", reply_markup=account_type_kb("inc_acc"))
         return
-
     if step == "bank_pick":
         await message.answer("Выбери банк/счёт из списка:", reply_markup=await pick_bank_kb("inc_bank"))
         return
-
     if step == "confirm":
         data = await state.get_data()
         await message.answer(build_income_summary(data) + "\n\nПодтвердить?",
@@ -2293,7 +2454,6 @@ async def inc_choose_wh(cq: CallbackQuery, state: FSMContext):
         return await cq.answer()
 
     action = parts[0]
-
     if action == "back":
         await income_go_to(state, "supplier_phone")
         await income_prompt(cq.message, state)
@@ -2336,7 +2496,6 @@ async def inc_choose_pr(cq: CallbackQuery, state: FSMContext):
         return await cq.answer()
 
     action = parts[0]
-
     if action == "back":
         await income_go_to(state, "warehouse_id")
         await income_prompt(cq.message, state)
@@ -2476,7 +2635,6 @@ async def inc_bank_pick(cq: CallbackQuery, state: FSMContext):
         return await cq.answer()
 
     action = parts[0]
-
     if action == "back":
         await income_go_to(state, "account_type")
         await income_prompt(cq.message, state)
@@ -2857,15 +3015,19 @@ async def deb_confirm(cq: CallbackQuery, state: FSMContext):
 async def main():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # migrations for allowed_users table / columns
         await ensure_allowed_users_schema(conn)
+        await ensure_users_schema(conn)
 
-    # ensure owner is in allowed_users (optional but useful for listing)
+    # ensure owner is in allowed_users (handy)
     async with Session() as s:
+        # owner in users too
+        u = await s.get(User, OWNER_ID)
+        if not u:
+            s.add(User(user_id=OWNER_ID, full_name="", username=None, created_at=datetime.utcnow()))
         exists = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == OWNER_ID))
         if not exists:
             s.add(AllowedUser(user_id=OWNER_ID, created_at=datetime.utcnow(), added_by=OWNER_ID, note="owner"))
-            await s.commit()
+        await s.commit()
 
     bot = Bot(TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
@@ -2878,4 +3040,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
