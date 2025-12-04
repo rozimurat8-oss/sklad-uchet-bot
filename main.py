@@ -597,6 +597,24 @@ class DebtorWizard(StatesGroup):
     delivery = State()
     confirm = State()
 
+def income_state_name(st):
+    m = {
+        IncomeWizard.doc_date: "doc_date",
+        IncomeWizard.supplier_name: "supplier_name",
+        IncomeWizard.supplier_phone: "supplier_phone",
+        IncomeWizard.warehouse: "warehouse",
+        IncomeWizard.product: "product",
+        IncomeWizard.qty: "qty",
+        IncomeWizard.price: "price",
+        IncomeWizard.delivery: "delivery",
+        IncomeWizard.add_money: "add_money",
+        IncomeWizard.pay_method: "pay_method",
+        IncomeWizard.account_type: "account_type",
+        IncomeWizard.bank_pick: "bank_pick",
+        IncomeWizard.confirm: "confirm",
+    }
+    return m.get(st, "unknown")
+
 
 class WarehousesAdmin(StatesGroup):
     adding = State()
@@ -1839,6 +1857,14 @@ async def list_incomes(message: Message, state: FSMContext):
 
 @router.message(F.text.in_(MAIN_BTNS | REPORTS_BTNS | WH_BTNS | PR_BTNS | BK_BTNS))
 @router.message(F.text.in_(MAIN_BTNS | REPORTS_BTNS | WH_BTNS | PR_BTNS | BK_BTNS))
+
+async def start_debtor(message: Message, state: FSMContext):
+    await state.clear()
+    await set_menu(state, "reports")
+    await state.set_state(DebtorWizard.doc_date)
+    await message.answer("Дата (для должника):", reply_markup=choose_date_kb("deb"))
+
+
 async def menu_router(message: Message, state: FSMContext):
     uid = message.from_user.id
     await upsert_user_from_tg(message.from_user)
