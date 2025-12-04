@@ -688,10 +688,8 @@ async def render_users_page(page: int) -> tuple[str, list[User], set[int]]:
 
         allowed_ids = set((await s.execute(select(AllowedUser.user_id))).scalars().all())
 
-    lines = [f"👥 <b>Users</b> (всего: <b>{total}</b>), стр <b>{page+1}</b>:
-"]
-"]
-for u in users:
+    lines = [f"👥 <b>Users</b> (всего: <b>{total}</b>), стр <b>{page+1}</b>:\n"]
+    for u in users:
         st = "✅" if (u.user_id in allowed_ids or is_owner(u.user_id)) else "⛔"
         uname = f"@{h(u.username)}" if u.username else "-"
         nm = h(u.name) if u.name else "-"
