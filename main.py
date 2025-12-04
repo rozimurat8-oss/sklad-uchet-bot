@@ -7,6 +7,7 @@ from decimal import Decimal
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
@@ -22,9 +23,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
-# -------------------------
-# ENV + DB
-# -------------------------
+
 load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
@@ -39,14 +38,10 @@ OWNER_ID = int(os.getenv("OWNER_ID", "139099578") or 0)
 
 print("=== BOOT ===", flush=True)
 print("TOKEN set:", bool(TOKEN), flush=True)
-# не светим креды/путь полностью
-print("DB:", "sqlite" if DB_URL.startswith("sqlite") else "non-sqlite", flush=True)
+print("DB_URL:", DB_URL, flush=True)
 print("OWNER_ID:", OWNER_ID, flush=True)
 
 
-# -------------------------
-# MODELS
-# -------------------------
 class Base(DeclarativeBase):
     pass
 
@@ -95,10 +90,10 @@ class MoneyLedger(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     entry_date: Mapped[date] = mapped_column(Date, index=True)
 
-    direction: Mapped[str] = mapped_column(String(10))  # in / out
-    method: Mapped[str] = mapped_column(String(10))     # cash / noncash
+    direction: Mapped[str] = mapped_column(String(10))
+    method: Mapped[str] = mapped_column(String(10))
 
-    account_type: Mapped[str] = mapped_column(String(10), default="cash")  # cash / bank / ip
+    account_type: Mapped[str] = mapped_column(String(10), default="cash")
     bank_id: Mapped[int | None] = mapped_column(ForeignKey("banks.id"), nullable=True)
     bank: Mapped["Bank | None"] = relationship()
 
@@ -191,9 +186,6 @@ class AllowedUser(Base):
     note: Mapped[str] = mapped_column(String(300), default="")
 
 
-# -------------------------
-# SCHEMA HELPERS (SQLite-safe)
-# -------------------------
 async def ensure_allowed_users_schema(conn):
     await conn.execute(text("PRAGMA foreign_keys=ON"))
     await conn.execute(text("""
@@ -261,9 +253,6 @@ async def ensure_users_schema(conn):
         pass
 
 
-# -------------------------
-# Helpers
-# -------------------------
 def dec(s: str) -> Decimal:
     s = (s or "").strip().replace(",", ".")
     return Decimal(s)
@@ -285,10 +274,10 @@ def safe_phone(s: str) -> str:
     return (s or "").strip()
 
 
+
+
 def h(s: str) -> str:
     return html.escape((s or "").strip(), quote=False)
-
-
 def parse_cb(data: str, prefix: str):
     if not data or not data.startswith(prefix + ":"):
         return []
@@ -344,78 +333,66 @@ async def set_menu(state: FSMContext, menu: str):
     await state.update_data(cur_menu=menu)
 
 
-# -------------------------
-# Keyboards
-# -------------------------
 def main_menu_kb(is_admin: bool):
     kb = ReplyKeyboardBuilder()
+    # Стабильные 2 колонки: короткие тексты и adjust(2) без пересборки сетки
     kb.button(text="🟢 Приход")
     kb.button(text="🔴 Продажа")
-    kb.adjust(2)
     kb.button(text="📦 Остатки")
     kb.button(text="💰 Деньги")
-    kb.adjust(2)
     kb.button(text="📊 Отчеты")
-    kb.adjust(1)
     kb.button(text="❌ Отмена")
-    kb.adjust(1)
+    kb.adjust(2, 2, 2)
     return kb.as_markup(resize_keyboard=True)
-
 
 def reports_menu_kb(is_admin: bool):
     kb = ReplyKeyboardBuilder()
+    # Стабильные 2 колонки (где возможно)
     kb.button(text="📄 Приходы")
     kb.button(text="📄 Продажи")
-    kb.adjust(2)
-    kb.button(text="📥 Выгрузка (таблица)")
+    kb.button(text="📥 Выгрузка")
     kb.button(text="📋 Должники")
-    kb.adjust(2)
-    kb.button(text="➕ Добавить должн...")
+    kb.button(text="➕ Должник")
     kb.button(text="🏬 Склады")
-    kb.adjust(2)
     kb.button(text="🧺 Товары")
     kb.button(text="🏦 Банки")
-    kb.adjust(2)
     if is_admin:
         kb.button(text="👥 Users")
-        kb.adjust(2)
     kb.button(text="⬅️ Назад")
-    kb.adjust(1)
-    return kb.as_markup(resize_keyboard=True)
 
+    # Если есть Users — 5 рядов по 2 + Назад отдельной строкой
+    if is_admin:
+        kb.adjust(2, 2, 2, 2, 1)
+    else:
+        kb.adjust(2, 2, 2, 2)
+    return kb.as_markup(resize_keyboard=True)
 
 def warehouses_menu_kb():
     kb = ReplyKeyboardBuilder()
     kb.button(text="➕ Добавить склад")
     kb.button(text="📃 Список складов")
-    kb.adjust(2)
     kb.button(text="🗑 Удалить склад")
     kb.button(text="⬅️ Назад в отчеты")
-    kb.adjust(2)
+    kb.adjust(2, 2)
     return kb.as_markup(resize_keyboard=True)
-
 
 def products_menu_kb():
     kb = ReplyKeyboardBuilder()
     kb.button(text="➕ Добавить товар")
     kb.button(text="📃 Список товаров")
-    kb.adjust(2)
     kb.button(text="🗑 Удалить товар")
     kb.button(text="⬅️ Назад в отчеты")
-    kb.adjust(2)
+    kb.adjust(2, 2)
     return kb.as_markup(resize_keyboard=True)
-
 
 def banks_menu_kb():
     kb = ReplyKeyboardBuilder()
     kb.button(text="➕ Добавить банк")
     kb.button(text="📃 Список банков")
-    kb.adjust(2)
     kb.button(text="🗑 Удалить банк")
     kb.button(text="⬅️ Назад в отчеты")
-    kb.adjust(2)
+    kb.adjust(2, 2)
     return kb.as_markup(resize_keyboard=True)
-
 
 def yes_no_kb(prefix: str):
     ikb = InlineKeyboardBuilder()
@@ -514,9 +491,6 @@ def choose_date_kb(scope: str):
     return ikb.as_markup()
 
 
-# -------------------------
-# States
-# -------------------------
 class AuthWizard(StatesGroup):
     ask_name = State()
 
@@ -590,59 +564,6 @@ class BanksAdmin(StatesGroup):
 
 router = Router()
 
-
-# -------------------------
-# Global access guard (fixes "продажа #id" etc)
-# -------------------------
-@router.message()
-async def _global_guard_messages(message: Message, state: FSMContext):
-    """
-    Этот "первый" хендлер перехватывает любые сообщения и:
-    - пропускает /start и /users /allow /deny /rmuser (их хендлеры ниже)
-    - пропускает ввод имени (AuthWizard.ask_name)
-    - для остальных требует is_allowed()
-    Затем "пробрасывает" дальше через middleware-подход: если ок — ничего не отвечает.
-    """
-    # дать отработать командам
-    if message.text and message.text.startswith("/"):
-        return
-
-    cur_state = await state.get_state()
-    if cur_state == AuthWizard.ask_name.state:
-        return
-
-    uid = message.from_user.id
-    await upsert_user_from_tg(message.from_user)
-
-    if not await is_allowed(uid):
-        # не спамим постоянно — просто одно сообщение
-        await message.answer("Нет доступа. Напишите /start для запроса доступа.")
-        # останавливаем дальнейшие хендлеры
-        return
-
-
-@router.callback_query()
-async def _global_guard_callbacks(cq: CallbackQuery, state: FSMContext):
-    """
-    Глобальная защита для всех callback'ов.
-    Разрешаем только:
-    - acc_req:* (владелец)
-    - все остальные — только если is_allowed()
-    """
-    if (cq.data or "").startswith("acc_req:"):
-        return
-
-    uid = cq.from_user.id
-    await upsert_user_from_tg(cq.from_user)
-
-    if not await is_allowed(uid):
-        await cq.answer("Нет доступа. Напишите /start", show_alert=True)
-        return
-
-
-# -------------------------
-# Buttons
-# -------------------------
 BTN = {
     "cancel": "❌ Отмена",
     "main_reports": "📊 Отчеты",
@@ -652,9 +573,9 @@ BTN = {
     "main_sale": "🔴 Продажа",
     "rep_incomes": "📄 Приходы",
     "rep_sales": "📄 Продажи",
-    "rep_export": "📥 Выгрузка (таблица)",
+    "rep_export": "📥 Выгрузка",
     "rep_debtors": "📋 Должники",
-    "rep_deb_add": "➕ Добавить должн...",
+    "rep_deb_add": "➕ Должник",
     "rep_wh": "🏬 Склады",
     "rep_pr": "🧺 Товары",
     "rep_bk": "🏦 Банки",
@@ -672,6 +593,7 @@ BTN = {
     "bk_del": "🗑 Удалить банк",
 }
 
+
 MAIN_BTNS = {
     BTN["main_income"], BTN["main_sale"], BTN["main_stocks"], BTN["main_money"], BTN["main_reports"], BTN["cancel"]
 }
@@ -686,9 +608,6 @@ PR_BTNS = {BTN["pr_add"], BTN["pr_list"], BTN["pr_del"], BTN["back_reports"]}
 BK_BTNS = {BTN["bk_add"], BTN["bk_list"], BTN["bk_del"], BTN["back_reports"]}
 
 
-# -------------------------
-# Allowed users ops
-# -------------------------
 async def allow_user(user_id: int, added_by: int, note: str = "approved"):
     async with Session() as s:
         exists = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == int(user_id)))
@@ -709,9 +628,6 @@ async def rm_user(user_id: int):
         await s.commit()
 
 
-# -------------------------
-# Users UI (fixed)
-# -------------------------
 USERS_PAGE_SIZE = 10
 
 
@@ -751,28 +667,20 @@ def user_manage_kb(uid: int, allowed: bool, back_page: int):
     return ikb.as_markup()
 
 
-async def render_users_page(page: int) -> tuple[str, list[User], set[int], bool, bool, int]:
+async def render_users_page(page: int) -> tuple[str, list[User], set[int]]:
     async with Session() as s:
         total = int(await s.scalar(select(func.count()).select_from(User)) or 0)
         if total == 0:
-            return "👥 Users: пусто.", [], set(), False, False, 0
+            return "👥 Users: пусто.", [], set()
 
-        page = max(int(page), 0)
-
-        # clamp page based on total
-        max_page = max(0, (total - 1) // USERS_PAGE_SIZE)
-        real_page = min(page, max_page)
-
+        page = max(page, 0)
         users = (await s.execute(
-            select(User).order_by(User.created_at.desc()).offset(real_page * USERS_PAGE_SIZE).limit(USERS_PAGE_SIZE)
+            select(User).order_by(User.created_at.desc()).offset(page * USERS_PAGE_SIZE).limit(USERS_PAGE_SIZE)
         )).scalars().all()
 
         allowed_ids = set((await s.execute(select(AllowedUser.user_id))).scalars().all())
 
-    has_prev = real_page > 0
-    has_next = real_page < max_page
-
-    lines = [f"👥 <b>Users</b> (всего: <b>{total}</b>), стр <b>{real_page + 1}</b>:\n"]
+    lines = [f"👥 <b>Users</b> (всего: <b>{total}</b>), стр <b>{page+1}</b>:\n"]
     for u in users:
         st = "✅" if (u.user_id in allowed_ids or is_owner(u.user_id)) else "⛔"
         uname = f"@{h(u.username)}" if u.username else "-"
@@ -780,8 +688,7 @@ async def render_users_page(page: int) -> tuple[str, list[User], set[int], bool,
         fn = h(u.full_name) if u.full_name else "-"
         lines.append(f"\n{st} <b>{u.user_id}</b> | {uname} | имя: <b>{nm}</b>\n└ {fn}")
 
-    return "\n".join(lines), users, allowed_ids, has_prev, has_next, real_page
-
+    return "\n".join(lines), users, allowed_ids
 
 async def render_user_card(uid: int) -> tuple[str, bool]:
     async with Session() as s:
@@ -804,11 +711,7 @@ async def render_user_card(uid: int) -> tuple[str, bool]:
     )
     return txt, (allowed or is_owner(u.user_id))
 
-
-# -------------------------
-# UI replies
-# -------------------------
-async def reply_in_menu(message: Message, state: FSMContext, text_: str, kb=None, parse_mode: ParseMode | None = None):
+async def reply_in_menu(message: Message, state: FSMContext, text_: str, kb=None, parse_mode=None):
     ui = await get_ui_ctx(state)
     is_admin = is_owner(message.from_user.id)
     if kb is None:
@@ -816,12 +719,12 @@ async def reply_in_menu(message: Message, state: FSMContext, text_: str, kb=None
     await message.answer(text_, reply_markup=kb, parse_mode=parse_mode)
 
 
-# -------------------------
-# Stock helpers
-# -------------------------
 async def get_stock_row(session, warehouse_id: int, product_id: int) -> Stock:
     row = await session.scalar(
-        select(Stock).where(Stock.warehouse_id == warehouse_id, Stock.product_id == product_id)
+        select(Stock).where(
+            Stock.warehouse_id == warehouse_id,
+            Stock.product_id == product_id
+        )
     )
     if row:
         return row
@@ -882,9 +785,6 @@ async def pick_bank_kb(prefix: str):
     return ikb.as_markup()
 
 
-# -------------------------
-# Views
-# -------------------------
 async def show_stocks_table(message: Message, state: FSMContext):
     async with Session() as s:
         rows = (await s.execute(
@@ -906,11 +806,11 @@ async def show_stocks_table(message: Message, state: FSMContext):
 
     lines = []
     lines.append(f"{'Склад'.ljust(w1)} | {'Товар'.ljust(w2)} | {'Остаток(кг)'.rjust(w3)}")
-    lines.append(f"{'-' * w1}-+-{'-' * w2}-+-{'-' * w3}")
+    lines.append(f"{'-'*w1}-+-{'-'*w2}-+-{'-'*w3}")
     for wh, pr, q in data:
         lines.append(f"{wh.ljust(w1)} | {pr.ljust(w2)} | {q.rjust(w3)}")
 
-    txt = "📦 <b>Остатки</b>:\n<pre>" + "\n".join(lines) + "</pre>"
+    txt = "📦 Остатки:\n<pre>" + "\n".join(lines) + "</pre>"
     await message.answer(txt, parse_mode=ParseMode.HTML)
     await reply_in_menu(message, state, "Готово ✅")
 
@@ -958,32 +858,27 @@ async def show_money(message: Message, state: FSMContext):
     bank_lines.sort(key=lambda x: x[0].lower())
     ip_lines.sort(key=lambda x: x[0].lower())
 
-    lines = [
-        "💰 <b>Деньги (балансы)</b>",
-        f"\n💵 <b>Наличные:</b> <b>{h(fmt_money(cash_balance))}</b>",
-        "\n🏦 <b>Банки:</b>",
-    ]
+    txt = ["💰 *Деньги (балансы):*",
+           f"\n💵 *Наличные:* *{fmt_money(cash_balance)}*"]
 
+    txt.append("\n🏦 *Банки:*")
     if bank_lines:
         for name, bal in bank_lines:
-            lines.append(f"• {h(name)}: <b>{h(fmt_money(bal))}</b>")
+            txt.append(f"• {name}: *{fmt_money(bal)}*")
     else:
-        lines.append("• (пусто)")
+        txt.append("• (пусто)")
 
-    lines.append("\n👤 <b>Счёт ИП:</b>")
+    txt.append("\n👤 *Счёт ИП:*")
     if ip_lines:
         for name, bal in ip_lines:
-            lines.append(f"• {h(name)}: <b>{h(fmt_money(bal))}</b>")
+            txt.append(f"• {name}: *{fmt_money(bal)}*")
     else:
-        lines.append("• (пусто)")
+        txt.append("• (пусто)")
 
-    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+    await message.answer("\n".join(txt), parse_mode=ParseMode.HTML)
     await reply_in_menu(message, state, "Готово ✅")
 
 
-# -------------------------
-# Export
-# -------------------------
 EXPORT_PAGE_SIZE = 20
 
 
@@ -1010,7 +905,7 @@ def export_pager_kb(kind: str, page: int, has_prev: bool, has_next: bool):
 
 async def export_menu(message: Message, state: FSMContext):
     await set_menu(state, "reports")
-    await message.answer("📥 <b>Выгрузка таблиц (в чате)</b>:", reply_markup=export_menu_kb(), parse_mode=ParseMode.HTML)
+    await message.answer("📥 Выгрузка таблиц (в чате):", reply_markup=export_menu_kb())
 
 
 def _render_pre_table(headers: list[str], rows: list[list[str]]) -> str:
@@ -1045,7 +940,7 @@ async def export_stocks_text(page: int):
         data.append([r.warehouse.name, r.product.name, fmt_kg(q)])
 
     if not data:
-        return "📦 <b>Остатки</b>: (везде 0)", None
+        return "📦 Остатки: (везде 0)", None
 
     total = len(data)
     start = max(0, page) * EXPORT_PAGE_SIZE
@@ -1055,7 +950,7 @@ async def export_stocks_text(page: int):
     has_prev = page > 0
     has_next = end < total
 
-    txt = "📦 <b>Остатки</b>:\n" + _render_pre_table(
+    txt = "📦 Остатки:\n" + _render_pre_table(
         headers=["Склад", "Товар", "Остаток(кг)"],
         rows=slice_rows
     )
@@ -1073,7 +968,7 @@ async def export_incomes_text(page: int):
         )).scalars().all()
 
     if not rows:
-        return "🟢 <b>Приходы</b>: записей нет.", None
+        return "🟢 Приходы: записей нет.", None
 
     data = []
     for r in rows:
@@ -1092,7 +987,7 @@ async def export_incomes_text(page: int):
     has_prev = page > 0
     has_next = end < total
 
-    txt = "🟢 <b>Приходы</b> (последние 50):\n" + _render_pre_table(
+    txt = "🟢 Приходы (последние 50):\n" + _render_pre_table(
         headers=["Дата", "Склад", "Товар", "Кол-во(кг)"],
         rows=slice_rows
     )
@@ -1110,7 +1005,7 @@ async def export_sales_text(page: int):
         )).scalars().all()
 
     if not rows:
-        return "🔴 <b>Продажи</b>: записей нет.", None
+        return "🔴 Продажи: записей нет.", None
 
     data = []
     for r in rows:
@@ -1135,7 +1030,7 @@ async def export_sales_text(page: int):
     has_prev = page > 0
     has_next = end < total
 
-    txt = "🔴 <b>Продажи</b> (последние 50):\n" + _render_pre_table(
+    txt = "🔴 Продажи (последние 50):\n" + _render_pre_table(
         headers=["Дата", "Кому", "Склад", "Товар", "Кол-во(кг)", "Цена/кг", "Сумма", "Опл"],
         rows=slice_rows
     )
@@ -1152,7 +1047,7 @@ async def export_router(cq: CallbackQuery, state: FSMContext):
     action = parts[1]
 
     if action == "menu":
-        await cq.message.answer("📥 <b>Выгрузка таблиц (в чате)</b>:", reply_markup=export_menu_kb(), parse_mode=ParseMode.HTML)
+        await cq.message.answer("📥 Выгрузка таблиц (в чате):", reply_markup=export_menu_kb())
         return await cq.answer()
 
     if action == "back":
@@ -1167,7 +1062,9 @@ async def export_router(cq: CallbackQuery, state: FSMContext):
     page_s = parts[2]
     if not page_s.lstrip("-").isdigit():
         return await cq.answer("Ошибка страницы", show_alert=True)
-    page = max(0, int(page_s))
+    page = int(page_s)
+    if page < 0:
+        page = 0
 
     if kind == "stocks":
         txt, kb = await export_stocks_text(page)
@@ -1187,9 +1084,6 @@ async def export_router(cq: CallbackQuery, state: FSMContext):
     return await cq.answer("Неизвестный раздел", show_alert=True)
 
 
-# -------------------------
-# Sales list/actions (HTML fixed)
-# -------------------------
 def sales_actions_kb(sale_id: int, paid: bool):
     ikb = InlineKeyboardBuilder()
     if not paid:
@@ -1242,7 +1136,7 @@ async def cb_sale_paid_id(cq: CallbackQuery):
 
         await s.commit()
 
-    await cq.message.answer(f"✅ Продажа <b>#{sale_id}</b> отмечена как оплачено.", parse_mode=ParseMode.HTML)
+    await cq.message.answer(f"✅ Продажа #{sale_id} отмечена как оплачено.")
     await cq.answer()
 
 
@@ -1260,7 +1154,7 @@ async def cb_sale_del(cq: CallbackQuery):
         await s.execute(delete(Sale).where(Sale.id == sale_id))
         await s.commit()
 
-    await cq.message.answer(f"🗑 Продажа <b>#{sale_id}</b> удалена.", parse_mode=ParseMode.HTML)
+    await cq.message.answer(f"🗑 Продажа #{sale_id} удалена.")
     await cq.answer()
 
 
@@ -1276,20 +1170,20 @@ async def list_sales(message: Message, state: FSMContext):
     if not rows:
         return await reply_in_menu(message, state, "Продаж пока нет.")
 
-    lines = ["📄 <b>Последние продажи</b> (последние 30):"]
+    lines = ["📄 *Последние продажи* (последние 30):"]
     for r in rows:
         paid = "✅" if r.is_paid else "🧾"
         acc = {"cash": "Нал", "bank": "Банк", "ip": "ИП"}.get(r.account_type, "-")
         bank_name = (r.bank.name if r.bank else "")
         where_txt = acc + (f" / {bank_name}" if bank_name else "")
         lines.append(
-            f"\n<b>#{r.id}</b> {paid} {h(str(r.doc_date))} — {h(r.customer_name)} ({h(r.customer_phone)})\n"
-            f"{h(r.warehouse.name)} / {h(r.product.name)} — {h(fmt_kg(r.qty_kg))} кг × {h(fmt_money(r.price_per_kg))} = <b>{h(fmt_money(r.total_amount))}</b>\n"
-            f"Куда: <b>{h(where_txt)}</b>"
+            f"\n*#{r.id}* {paid} {r.doc_date} — {r.customer_name} ({r.customer_phone})\n"
+            f"{r.warehouse.name} / {r.product.name} — {fmt_kg(r.qty_kg)} кг × {fmt_money(r.price_per_kg)} = *{fmt_money(r.total_amount)}*\n"
+            f"Куда: *{where_txt}*"
         )
 
     await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
-    await reply_in_menu(message, state, "Чтобы управлять: напиши <code>продажа #ID</code> например: <code>продажа #12</code>",
+    await reply_in_menu(message, state, "Чтобы управлять: напиши `продажа #ID` например: `продажа #12`",
                         parse_mode=ParseMode.HTML)
 
 
@@ -1311,24 +1205,21 @@ async def sale_by_id(message: Message, state: FSMContext):
     where_txt = f"{acc}" + (f" / {bank_name}" if r.account_type in ("bank", "ip") else "")
 
     txt = (
-        f"🔴 <b>Продажа #{r.id}</b>\n"
-        f"Дата: <b>{h(str(r.doc_date))}</b>\n"
-        f"Клиент: <b>{h(r.customer_name)}</b> / {h(r.customer_phone)}\n"
-        f"Склад: <b>{h(r.warehouse.name)}</b>\n"
-        f"Товар: <b>{h(r.product.name)}</b>\n"
-        f"Кол-во: <b>{h(fmt_kg(r.qty_kg))} кг</b>\n"
-        f"Цена: <b>{h(fmt_money(r.price_per_kg))}</b>\n"
-        f"Сумма: <b>{h(fmt_money(r.total_amount))}</b>\n"
-        f"Доставка: <b>{h(fmt_money(r.delivery_cost))}</b>\n"
-        f"Статус: <b>{h(paid)}</b>\n"
-        f"Куда: <b>{h(where_txt)}</b>"
+        f"🔴 *Продажа #{r.id}*\n"
+        f"Дата: *{r.doc_date}*\n"
+        f"Клиент: *{r.customer_name}* / {r.customer_phone}\n"
+        f"Склад: *{r.warehouse.name}*\n"
+        f"Товар: *{r.product.name}*\n"
+        f"Кол-во: *{fmt_kg(r.qty_kg)} кг*\n"
+        f"Цена: *{fmt_money(r.price_per_kg)}*\n"
+        f"Сумма: *{fmt_money(r.total_amount)}*\n"
+        f"Доставка: *{fmt_money(r.delivery_cost)}*\n"
+        f"Статус: *{paid}*\n"
+        f"Куда: *{where_txt}*"
     )
     await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=sales_actions_kb(r.id, r.is_paid))
 
 
-# -------------------------
-# Incomes list/actions (HTML fixed)
-# -------------------------
 def income_actions_kb(income_id: int):
     ikb = InlineKeyboardBuilder()
     ikb.button(text="🗑 Удалить", callback_data=f"inc_del:{income_id}")
@@ -1348,7 +1239,7 @@ async def cb_inc_del(cq: CallbackQuery):
             return await cq.answer("Не найдено", show_alert=True)
         await s.execute(delete(Income).where(Income.id == income_id))
         await s.commit()
-    await cq.message.answer(f"🗑 Приход <b>#{income_id}</b> удалён.", parse_mode=ParseMode.HTML)
+    await cq.message.answer(f"🗑 Приход #{income_id} удалён.")
     await cq.answer()
 
 
@@ -1364,19 +1255,19 @@ async def list_incomes(message: Message, state: FSMContext):
     if not rows:
         return await reply_in_menu(message, state, "Приходов пока нет.")
 
-    lines = ["📄 <b>Последние приходы</b> (последние 30):"]
+    lines = ["📄 *Последние приходы* (последние 30):"]
     for r in rows:
         acc = {"cash": "Нал", "bank": "Банк", "ip": "ИП"}.get(r.account_type, "-")
         bank_name = (r.bank.name if r.bank else "")
         where_txt = acc + (f" / {bank_name}" if bank_name else "")
         lines.append(
-            f"\n<b>#{r.id}</b> {h(str(r.doc_date))} — {h(r.supplier_name)} ({h(r.supplier_phone)})\n"
-            f"{h(r.warehouse.name)} / {h(r.product.name)} — {h(fmt_kg(r.qty_kg))} кг × {h(fmt_money(r.price_per_kg))} = <b>{h(fmt_money(r.total_amount))}</b>\n"
-            f"Расход денег: <b>{'✅' if r.add_money_entry else '❌'}</b> | Куда: <b>{h(where_txt)}</b>"
+            f"\n*#{r.id}* {r.doc_date} — {r.supplier_name} ({r.supplier_phone})\n"
+            f"{r.warehouse.name} / {r.product.name} — {fmt_kg(r.qty_kg)} кг × {fmt_money(r.price_per_kg)} = *{fmt_money(r.total_amount)}*\n"
+            f"Расход денег: *{'✅' if r.add_money_entry else '❌'}* | Куда: *{where_txt}*"
         )
 
     await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
-    await reply_in_menu(message, state, "Чтобы посмотреть: напиши <code>приход #ID</code> например: <code>приход #7</code>",
+    await reply_in_menu(message, state, "Чтобы посмотреть: напиши `приход #ID` например: `приход #7`",
                         parse_mode=ParseMode.HTML)
 
 
@@ -1397,24 +1288,21 @@ async def inc_by_id(message: Message, state: FSMContext):
     where_txt = f"{acc}" + (f" / {bank_name}" if r.account_type in ("bank", "ip") else "")
 
     txt = (
-        f"🟢 <b>Приход #{r.id}</b>\n"
-        f"Дата: <b>{h(str(r.doc_date))}</b>\n"
-        f"Поставщик: <b>{h(r.supplier_name)}</b> / {h(r.supplier_phone)}\n"
-        f"Склад: <b>{h(r.warehouse.name)}</b>\n"
-        f"Товар: <b>{h(r.product.name)}</b>\n"
-        f"Кол-во: <b>{h(fmt_kg(r.qty_kg))} кг</b>\n"
-        f"Цена: <b>{h(fmt_money(r.price_per_kg))}</b>\n"
-        f"Сумма: <b>{h(fmt_money(r.total_amount))}</b>\n"
-        f"Доставка: <b>{h(fmt_money(r.delivery_cost))}</b>\n"
-        f"Расход денег по приходу: <b>{'✅' if r.add_money_entry else '❌'}</b>\n"
-        f"Куда: <b>{h(where_txt)}</b>"
+        f"🟢 *Приход #{r.id}*\n"
+        f"Дата: *{r.doc_date}*\n"
+        f"Поставщик: *{r.supplier_name}* / {r.supplier_phone}\n"
+        f"Склад: *{r.warehouse.name}*\n"
+        f"Товар: *{r.product.name}*\n"
+        f"Кол-во: *{fmt_kg(r.qty_kg)} кг*\n"
+        f"Цена: *{fmt_money(r.price_per_kg)}*\n"
+        f"Сумма: *{fmt_money(r.total_amount)}*\n"
+        f"Доставка: *{fmt_money(r.delivery_cost)}*\n"
+        f"Расход денег по приходу: *{'✅' if r.add_money_entry else '❌'}*\n"
+        f"Куда: *{where_txt}*"
     )
     await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=income_actions_kb(r.id))
 
 
-# -------------------------
-# Debtors list/actions (HTML fixed)
-# -------------------------
 def debtor_actions_kb(debtor_id: int, paid: bool):
     ikb = InlineKeyboardBuilder()
     if not paid:
@@ -1436,7 +1324,7 @@ async def cb_deb_paid(cq: CallbackQuery):
             return await cq.answer("Не найдено", show_alert=True)
         d.is_paid = True
         await s.commit()
-    await cq.message.answer(f"✅ Должник <b>#{debtor_id}</b> отмечен как оплачено.", parse_mode=ParseMode.HTML)
+    await cq.message.answer(f"✅ Должник #{debtor_id} отмечен как оплачено.")
     await cq.answer()
 
 
@@ -1449,7 +1337,7 @@ async def cb_deb_del(cq: CallbackQuery):
     async with Session() as s:
         await s.execute(delete(Debtor).where(Debtor.id == debtor_id))
         await s.commit()
-    await cq.message.answer(f"🗑 Должник <b>#{debtor_id}</b> удалён.", parse_mode=ParseMode.HTML)
+    await cq.message.answer(f"🗑 Должник #{debtor_id} удалён.")
     await cq.answer()
 
 
@@ -1460,16 +1348,16 @@ async def list_debtors(message: Message, state: FSMContext):
     if not rows:
         return await reply_in_menu(message, state, "Должников нет ✅")
 
-    lines = ["📋 <b>Должники</b> (последние 50):"]
+    lines = ["📋 *Должники* (последние 50):"]
     for r in rows:
         status = "✅" if r.is_paid else "🧾"
         lines.append(
-            f"\n<b>#{r.id}</b> {status} {h(str(r.doc_date))} — {h(r.customer_name)} ({h(r.customer_phone)})\n"
-            f"{h(r.warehouse_name)} / {h(r.product_name)} — {h(fmt_kg(r.qty_kg))} кг × {h(fmt_money(r.price_per_kg))} = <b>{h(fmt_money(r.total_amount))}</b>"
+            f"\n*#{r.id}* {status} {r.doc_date} — {r.customer_name} ({r.customer_phone})\n"
+            f"{r.warehouse_name} / {r.product_name} — {fmt_kg(r.qty_kg)} кг × {fmt_money(r.price_per_kg)} = *{fmt_money(r.total_amount)}*"
         )
 
     await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
-    await reply_in_menu(message, state, "Чтобы управлять: напиши <code>должник #ID</code> например: <code>должник #3</code>",
+    await reply_in_menu(message, state, "Чтобы управлять: напиши `должник #ID` например: `должник #3`",
                         parse_mode=ParseMode.HTML)
 
 
@@ -1483,23 +1371,20 @@ async def debtor_by_id(message: Message, state: FSMContext):
 
     status = "✅ Оплачено" if r.is_paid else "🧾 Не оплачено"
     txt = (
-        f"📋 <b>Должник #{r.id}</b>\n"
-        f"Дата: <b>{h(str(r.doc_date))}</b>\n"
-        f"Клиент: <b>{h(r.customer_name)}</b> / {h(r.customer_phone)}\n"
-        f"Склад: <b>{h(r.warehouse_name)}</b>\n"
-        f"Товар: <b>{h(r.product_name)}</b>\n"
-        f"Кол-во: <b>{h(fmt_kg(r.qty_kg))} кг</b>\n"
-        f"Цена: <b>{h(fmt_money(r.price_per_kg))}</b>\n"
-        f"Сумма: <b>{h(fmt_money(r.total_amount))}</b>\n"
-        f"Доставка: <b>{h(fmt_money(r.delivery_cost))}</b>\n"
-        f"Статус: <b>{h(status)}</b>"
+        f"📋 *Должник #{r.id}*\n"
+        f"Дата: *{r.doc_date}*\n"
+        f"Клиент: *{r.customer_name}* / {r.customer_phone}\n"
+        f"Склад: *{r.warehouse_name}*\n"
+        f"Товар: *{r.product_name}*\n"
+        f"Кол-во: *{fmt_kg(r.qty_kg)} кг*\n"
+        f"Цена: *{fmt_money(r.price_per_kg)}*\n"
+        f"Сумма: *{fmt_money(r.total_amount)}*\n"
+        f"Доставка: *{fmt_money(r.delivery_cost)}*\n"
+        f"Статус: *{status}*"
     )
     await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=debtor_actions_kb(r.id, r.is_paid))
 
 
-# -------------------------
-# /start + access request
-# -------------------------
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
@@ -1560,7 +1445,7 @@ async def auth_ask_name(message: Message, state: FSMContext):
     await set_menu(state, "main")
 
     if await is_allowed(uid):
-        return await message.answer(f"✅ Отлично, {h(name)}! Выбери действие:", reply_markup=main_menu_kb(is_owner(uid)))
+        return await message.answer(f"✅ Отлично, {name}! Выбери действие:", reply_markup=main_menu_kb(is_owner(uid)))
 
     return await message.answer("✅ Имя сохранено. Доступ к боту выдаёт владелец. Напиши /start после одобрения.")
 
@@ -1595,16 +1480,13 @@ async def cb_access_req(cq: CallbackQuery):
     return await cq.answer("Ок")
 
 
-# -------------------------
-# Owner commands
-# -------------------------
 @router.message(Command("users"))
 async def cmd_users(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         return await message.answer("Нет доступа.")
     await set_menu(state, "reports")
     page = 0
-    txt, users, allowed_ids, has_prev, has_next, real_page = await render_users_page(page)
+    txt, users, has_prev, has_next, allowed_ids, real_page = await render_users_page(page)
     kb = users_list_kb(real_page, users, allowed_ids, has_prev, has_next) if users else users_pager_kb(real_page, has_prev, has_next)
     await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -1664,9 +1546,11 @@ async def users_inline_router(cq: CallbackQuery):
     if action == "page":
         if not parts[2].lstrip("-").isdigit():
             return await cq.answer("Ошибка страницы", show_alert=True)
-        page = max(0, int(parts[2]))
+        page = int(parts[2])
+        if page < 0:
+            page = 0
 
-        txt, users, allowed_ids, has_prev, has_next, real_page = await render_users_page(page)
+        txt, users, has_prev, has_next, allowed_ids, real_page = await render_users_page(page)
         if not users:
             await cq.message.edit_text(txt, parse_mode=ParseMode.HTML, reply_markup=None)
             return await cq.answer()
@@ -1718,9 +1602,6 @@ async def users_inline_router(cq: CallbackQuery):
     return await cq.answer()
 
 
-# -------------------------
-# Menus router
-# -------------------------
 async def show_reports_menu(message: Message, state: FSMContext):
     await set_menu(state, "reports")
     await state.clear()
@@ -1731,6 +1612,10 @@ async def show_reports_menu(message: Message, state: FSMContext):
 @router.message(F.text.in_(MAIN_BTNS | REPORTS_BTNS | WH_BTNS | PR_BTNS | BK_BTNS))
 async def menu_router(message: Message, state: FSMContext):
     uid = message.from_user.id
+    await upsert_user_from_tg(message.from_user)
+
+    if not (await is_allowed(uid)):
+        return await message.answer("Нет доступа. Напишите /start для запроса доступа.")
 
     text_ = message.text
     is_admin = is_owner(uid)
@@ -1783,7 +1668,7 @@ async def menu_router(message: Message, state: FSMContext):
         if not is_admin:
             return await message.answer("Нет доступа.", reply_markup=reports_menu_kb(is_admin))
         page = 0
-        txt, users, allowed_ids, has_prev, has_next, real_page = await render_users_page(page)
+        txt, users, has_prev, has_next, allowed_ids, real_page = await render_users_page(page)
         kb = users_list_kb(real_page, users, allowed_ids, has_prev, has_next) if users else users_pager_kb(real_page, has_prev, has_next)
         return await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -1883,9 +1768,6 @@ async def menu_router(message: Message, state: FSMContext):
         return await message.answer("Напиши EXACT название банка для удаления:", reply_markup=banks_menu_kb())
 
 
-# -------------------------
-# Admin: Warehouses / Products / Banks (HTML fixed)
-# -------------------------
 @router.message(WarehousesAdmin.adding)
 async def wh_add(message: Message, state: FSMContext):
     name = safe_text(message.text)
@@ -1901,7 +1783,7 @@ async def wh_add(message: Message, state: FSMContext):
         await s.commit()
     await state.clear()
     await set_menu(state, "reports")
-    await message.answer(f"✅ Склад добавлен: <b>{h(name)}</b>", reply_markup=warehouses_menu_kb(), parse_mode=ParseMode.HTML)
+    await message.answer(f"✅ Склад добавлен: {name}", reply_markup=warehouses_menu_kb())
 
 
 @router.message(WarehousesAdmin.deleting)
@@ -1925,7 +1807,7 @@ async def wh_del(message: Message, state: FSMContext):
 
     await state.clear()
     await set_menu(state, "reports")
-    await message.answer(f"🗑 Склад удалён: <b>{h(name)}</b>", reply_markup=warehouses_menu_kb(), parse_mode=ParseMode.HTML)
+    await message.answer(f"🗑 Склад удалён: {name}", reply_markup=warehouses_menu_kb())
 
 
 async def list_warehouses(message: Message):
@@ -1933,7 +1815,7 @@ async def list_warehouses(message: Message):
         rows = (await s.execute(select(Warehouse).order_by(Warehouse.name))).scalars().all()
     if not rows:
         return await message.answer("Складов пока нет. Добавь через ➕", reply_markup=warehouses_menu_kb())
-    txt = "🏬 <b>Склады</b>:\n" + "\n".join([f"• {h(w.name)}" for w in rows])
+    txt = "🏬 *Склады:*\n" + "\n".join([f"• {w.name}" for w in rows])
     await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=warehouses_menu_kb())
 
 
@@ -1952,7 +1834,7 @@ async def prod_add(message: Message, state: FSMContext):
         await s.commit()
     await state.clear()
     await set_menu(state, "reports")
-    await message.answer(f"✅ Товар добавлен: <b>{h(name)}</b>", reply_markup=products_menu_kb(), parse_mode=ParseMode.HTML)
+    await message.answer(f"✅ Товар добавлен: {name}", reply_markup=products_menu_kb())
 
 
 @router.message(ProductsAdmin.deleting)
@@ -1976,7 +1858,7 @@ async def prod_del(message: Message, state: FSMContext):
 
     await state.clear()
     await set_menu(state, "reports")
-    await message.answer(f"🗑 Товар удалён: <b>{h(name)}</b>", reply_markup=products_menu_kb(), parse_mode=ParseMode.HTML)
+    await message.answer(f"🗑 Товар удалён: {name}", reply_markup=products_menu_kb())
 
 
 async def list_products(message: Message):
@@ -1984,7 +1866,7 @@ async def list_products(message: Message):
         rows = (await s.execute(select(Product).order_by(Product.name))).scalars().all()
     if not rows:
         return await message.answer("Товаров пока нет. Добавь через ➕", reply_markup=products_menu_kb())
-    txt = "🧺 <b>Товары</b>:\n" + "\n".join([f"• {h(p.name)}" for p in rows])
+    txt = "🧺 *Товары:*\n" + "\n".join([f"• {p.name}" for p in rows])
     await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=products_menu_kb())
 
 
@@ -2003,7 +1885,7 @@ async def bank_add(message: Message, state: FSMContext):
         await s.commit()
     await state.clear()
     await set_menu(state, "reports")
-    await message.answer(f"✅ Банк добавлен: <b>{h(name)}</b>", reply_markup=banks_menu_kb(), parse_mode=ParseMode.HTML)
+    await message.answer(f"✅ Банк добавлен: {name}", reply_markup=banks_menu_kb())
 
 
 @router.message(BanksAdmin.deleting)
@@ -2027,7 +1909,7 @@ async def bank_del(message: Message, state: FSMContext):
 
     await state.clear()
     await set_menu(state, "reports")
-    await message.answer(f"🗑 Банк удалён: <b>{h(name)}</b>", reply_markup=banks_menu_kb(), parse_mode=ParseMode.HTML)
+    await message.answer(f"🗑 Банк удалён: {name}", reply_markup=banks_menu_kb())
 
 
 async def list_banks(message: Message):
@@ -2035,13 +1917,10 @@ async def list_banks(message: Message):
         rows = (await s.execute(select(Bank).order_by(Bank.name))).scalars().all()
     if not rows:
         return await message.answer("Банков пока нет. Добавь через ➕", reply_markup=banks_menu_kb())
-    txt = "🏦 <b>Банки</b>:\n" + "\n".join([f"• {h(b.name)}" for b in rows])
+    txt = "🏦 *Банки:*\n" + "\n".join([f"• {b.name}" for b in rows])
     await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=banks_menu_kb())
 
 
-# -------------------------
-# SALE FLOW
-# -------------------------
 SALE_FLOW = [
     "doc_date", "customer_name", "customer_phone", "warehouse_id", "product_id",
     "qty", "price", "delivery", "paid_status", "pay_method", "account_type", "bank_pick", "confirm"
@@ -2069,32 +1948,6 @@ async def sale_go_to(state: FSMContext, step: str):
         "confirm": SaleWizard.confirm,
     }
     await state.set_state(mapping[step])
-
-
-async def _resolve_ids_for_summary(data: dict) -> dict:
-    """
-    Чтобы в summary не было #id, а нормальные названия.
-    """
-    wh_id = data.get("warehouse_id")
-    pr_id = data.get("product_id")
-    bank_id = data.get("bank_id")
-
-    out = {"warehouse_name": "-", "product_name": "-", "bank_name": "-"}
-
-    async with Session() as s:
-        if wh_id:
-            w = await s.get(Warehouse, int(wh_id))
-            if w:
-                out["warehouse_name"] = w.name
-        if pr_id:
-            p = await s.get(Product, int(pr_id))
-            if p:
-                out["product_name"] = p.name
-        if bank_id:
-            b = await s.get(Bank, int(bank_id))
-            if b:
-                out["bank_name"] = b.name
-    return out
 
 
 async def sale_prompt(message: Message, state: FSMContext):
@@ -2139,8 +1992,7 @@ async def sale_prompt(message: Message, state: FSMContext):
         return
     if step == "confirm":
         data = await state.get_data()
-        txt = await build_sale_summary_html(data)
-        await message.answer(txt + "\n\n<b>Подтвердить?</b>",
+        await message.answer(build_sale_summary(data) + "\n\nПодтвердить?",
                              parse_mode=ParseMode.HTML,
                              reply_markup=yes_no_kb("sale_confirm"))
         return
@@ -2170,7 +2022,7 @@ async def cal_sale_handler(cq: CallbackQuery, state: FSMContext):
         d = datetime.strptime(payload, "%Y-%m-%d").date()
         await state.update_data(doc_date=d.isoformat())
         await sale_go_to(state, "customer_name")
-        await cq.message.answer(f"✅ Дата выбрана: {h(d.isoformat())}", parse_mode=ParseMode.HTML)
+        await cq.message.answer(f"✅ Дата выбрана: {d.isoformat()}")
         await sale_prompt(cq.message, state)
         return await cq.answer()
 
@@ -2458,36 +2310,40 @@ async def sale_add_bank_inline(message: Message, state: FSMContext):
     await message.answer("✅ Банк добавлен. Теперь выбери банк:", reply_markup=await pick_bank_kb("sale_bank"))
 
 
-async def build_sale_summary_html(data: dict) -> str:
+def build_sale_summary(data: dict) -> str:
     qty = Decimal(data["qty"])
     price = Decimal(data["price"])
     total = qty * price
     delivery = Decimal(data.get("delivery", "0"))
     paid = "✅ Оплачено" if data.get("is_paid") else "🧾 Не оплачено"
-    pay_method = "Нал" if (data.get("payment_method") == "cash") else ("Безнал" if data.get("payment_method") == "noncash" else "-")
+    pay_method = data.get("payment_method") or "-"
 
-    acc_map = {"cash": "Наличные", "bank": "Банк", "ip": "Счёт ИП"}
-    acc = acc_map.get(data.get("account_type"), "-")
+    acc = {"cash": "Наличные", "bank": "Банк", "ip": "Счёт ИП"}.get(data.get("account_type"), "-")
+    bank_id = data.get("bank_id")
 
-    resolved = await _resolve_ids_for_summary(data)
-    wh_name = resolved["warehouse_name"]
-    pr_name = resolved["product_name"]
-    bank_name = resolved["bank_name"] if data.get("account_type") in ("bank", "ip") else "-"
+    wh_id = data.get("warehouse_id")
+    pr_id = data.get("product_id")
+    wh_name = f"#{wh_id}" if wh_id else "-"
+    pr_name = f"#{pr_id}" if pr_id else "-"
+
+    bank_txt = "-"
+    if data.get("account_type") in ("bank", "ip"):
+        bank_txt = f"#{bank_id}" if bank_id else "-"
 
     return (
-        "🔴 <b>ПРОДАЖА (проверка)</b>\n"
-        f"Дата: <b>{h(data.get('doc_date','-'))}</b>\n"
-        f"Клиент: <b>{h(data.get('customer_name','-'))}</b> / {h(data.get('customer_phone','-'))}\n"
-        f"Склад: <b>{h(wh_name)}</b>\n"
-        f"Товар: <b>{h(pr_name)}</b>\n"
-        f"Кол-во: <b>{h(fmt_kg(qty))} кг</b>\n"
-        f"Цена: <b>{h(fmt_money(price))}</b>\n"
-        f"Сумма: <b>{h(fmt_money(total))}</b>\n"
-        f"Доставка: <b>{h(fmt_money(delivery))}</b>\n"
-        f"Оплата: <b>{h(paid)}</b>\n"
-        f"Метод: <b>{h(pay_method)}</b>\n"
-        f"Куда: <b>{h(acc)}</b>\n"
-        f"Банк/ИП: <b>{h(bank_name)}</b>"
+        "🔴 *ПРОДАЖА (проверка):*\n"
+        f"Дата: *{data.get('doc_date','-')}*\n"
+        f"Клиент: *{data.get('customer_name','-')}* / {data.get('customer_phone','-')}\n"
+        f"Склад: *{wh_name}*\n"
+        f"Товар: *{pr_name}*\n"
+        f"Кол-во: *{fmt_kg(qty)} кг*\n"
+        f"Цена: *{fmt_money(price)}*\n"
+        f"Сумма: *{fmt_money(total)}*\n"
+        f"Доставка: *{fmt_money(delivery)}*\n"
+        f"Оплата: *{paid}*\n"
+        f"Метод: *{pay_method}*\n"
+        f"Куда: *{acc}*\n"
+        f"Банк/ИП: *{bank_txt}*"
     )
 
 
@@ -2513,7 +2369,7 @@ async def sale_confirm(cq: CallbackQuery, state: FSMContext):
     total = qty * price
     delivery = Decimal(data.get("delivery", "0"))
 
-    is_paid_ = bool(data.get("is_paid"))
+    is_paid = bool(data.get("is_paid"))
     payment_method = data.get("payment_method", "")
 
     account_type = data.get("account_type", "cash")
@@ -2569,9 +2425,8 @@ async def sale_confirm(cq: CallbackQuery, state: FSMContext):
             await state.clear()
             await set_menu(state, "main")
             await cq.message.answer(
-                f"❗ Недостаточно товара.\nЕсть: {h(fmt_kg(cur_qty))} кг, нужно: {h(fmt_kg(qty))} кг",
-                reply_markup=main_menu_kb(is_owner(cq.from_user.id)),
-                parse_mode=ParseMode.HTML
+                f"❗ Недостаточно товара.\nЕсть: {fmt_kg(cur_qty)} кг, нужно: {fmt_kg(qty)} кг",
+                reply_markup=main_menu_kb(is_owner(cq.from_user.id))
             )
             return await cq.answer()
 
@@ -2585,15 +2440,15 @@ async def sale_confirm(cq: CallbackQuery, state: FSMContext):
             price_per_kg=price,
             total_amount=total,
             delivery_cost=delivery,
-            is_paid=is_paid_,
-            payment_method=payment_method if is_paid_ else "",
-            account_type=account_type if is_paid_ else "cash",
-            bank_id=bank_id if (is_paid_ and account_type in ("bank", "ip")) else None
+            is_paid=is_paid,
+            payment_method=payment_method if is_paid else "",
+            account_type=account_type if is_paid else "cash",
+            bank_id=bank_id if (is_paid and account_type in ("bank", "ip")) else None
         )
         s.add(sale)
         await s.flush()
 
-        if is_paid_:
+        if is_paid:
             s.add(MoneyLedger(
                 entry_date=doc_date,
                 direction="in",
@@ -2625,9 +2480,6 @@ async def sale_confirm(cq: CallbackQuery, state: FSMContext):
     await cq.answer()
 
 
-# -------------------------
-# INCOME FLOW (with atomic stock increment)
-# -------------------------
 INCOME_FLOW = [
     "doc_date", "supplier_name", "supplier_phone", "warehouse_id", "product_id",
     "qty", "price", "delivery", "add_money", "pay_method", "account_type", "bank_pick", "confirm"
@@ -2699,8 +2551,7 @@ async def income_prompt(message: Message, state: FSMContext):
         return
     if step == "confirm":
         data = await state.get_data()
-        txt = await build_income_summary_html(data)
-        await message.answer(txt + "\n\n<b>Подтвердить?</b>",
+        await message.answer(build_income_summary(data) + "\n\nПодтвердить?",
                              parse_mode=ParseMode.HTML,
                              reply_markup=yes_no_kb("inc_confirm"))
         return
@@ -2730,7 +2581,7 @@ async def cal_inc_handler(cq: CallbackQuery, state: FSMContext):
         d = datetime.strptime(payload, "%Y-%m-%d").date()
         await state.update_data(doc_date=d.isoformat())
         await income_go_to(state, "supplier_name")
-        await cq.message.answer(f"✅ Дата выбрана: {h(d.isoformat())}", parse_mode=ParseMode.HTML)
+        await cq.message.answer(f"✅ Дата выбрана: {d.isoformat()}")
         await income_prompt(cq.message, state)
         return await cq.answer()
 
@@ -3018,36 +2869,39 @@ async def inc_add_bank_inline(message: Message, state: FSMContext):
     await message.answer("✅ Банк добавлен. Теперь выбери банк:", reply_markup=await pick_bank_kb("inc_bank"))
 
 
-async def build_income_summary_html(data: dict) -> str:
+def build_income_summary(data: dict) -> str:
     qty = Decimal(data["qty"])
     price = Decimal(data["price"])
     total = qty * price
     delivery = Decimal(data.get("delivery", "0"))
     add_money = "✅ Да" if data.get("add_money_entry") else "❌ Нет"
-    method = "Нал" if (data.get("payment_method") == "cash") else ("Безнал" if data.get("payment_method") == "noncash" else "-")
+    method = data.get("payment_method") or "-"
 
-    acc_map = {"cash": "Наличные", "bank": "Банк", "ip": "Счёт ИП"}
-    acc = acc_map.get(data.get("account_type"), "-")
+    acc = {"cash": "Наличные", "bank": "Банк", "ip": "Счёт ИП"}.get(data.get("account_type"), "-")
+    bank_id = data.get("bank_id")
+    bank_txt = "-"
+    if data.get("account_type") in ("bank", "ip"):
+        bank_txt = f"#{bank_id}" if bank_id else "-"
 
-    resolved = await _resolve_ids_for_summary(data)
-    wh_name = resolved["warehouse_name"]
-    pr_name = resolved["product_name"]
-    bank_name = resolved["bank_name"] if data.get("account_type") in ("bank", "ip") else "-"
+    wh_id = data.get("warehouse_id")
+    pr_id = data.get("product_id")
+    wh_name = f"#{wh_id}" if wh_id else "-"
+    pr_name = f"#{pr_id}" if pr_id else "-"
 
     return (
-        "🟢 <b>ПРИХОД (проверка)</b>\n"
-        f"Дата: <b>{h(data.get('doc_date','-'))}</b>\n"
-        f"Поставщик: <b>{h(data.get('supplier_name','-'))}</b> / {h(data.get('supplier_phone','-'))}\n"
-        f"Склад: <b>{h(wh_name)}</b>\n"
-        f"Товар: <b>{h(pr_name)}</b>\n"
-        f"Кол-во: <b>{h(fmt_kg(qty))} кг</b>\n"
-        f"Цена: <b>{h(fmt_money(price))}</b>\n"
-        f"Сумма: <b>{h(fmt_money(total))}</b>\n"
-        f"Доставка: <b>{h(fmt_money(delivery))}</b>\n"
-        f"Запись денег (расход): <b>{h(add_money)}</b>\n"
-        f"Метод оплаты: <b>{h(method)}</b>\n"
-        f"С какого счёта: <b>{h(acc)}</b>\n"
-        f"Банк/ИП: <b>{h(bank_name)}</b>"
+        "🟢 *ПРИХОД (проверка):*\n"
+        f"Дата: *{data.get('doc_date','-')}*\n"
+        f"Поставщик: *{data.get('supplier_name','-')}* / {data.get('supplier_phone','-')}\n"
+        f"Склад: *{wh_name}*\n"
+        f"Товар: *{pr_name}*\n"
+        f"Кол-во: *{fmt_kg(qty)} кг*\n"
+        f"Цена: *{fmt_money(price)}*\n"
+        f"Сумма: *{fmt_money(total)}*\n"
+        f"Доставка: *{fmt_money(delivery)}*\n"
+        f"Запись денег (расход): *{add_money}*\n"
+        f"Метод оплаты: *{method}*\n"
+        f"С какого счёта: *{acc}*\n"
+        f"Банк/ИП: *{bank_txt}*"
     )
 
 
@@ -3105,15 +2959,8 @@ async def inc_confirm(cq: CallbackQuery, state: FSMContext):
                 await cq.answer("Банк не найден", show_alert=True)
                 return
 
-        # ensure stock row exists
-        await get_stock_row(s, w.id, p.id)
-
-        # ATOMIC increment stock
-        await s.execute(
-            update(Stock)
-            .where(Stock.warehouse_id == w.id, Stock.product_id == p.id)
-            .values(qty_kg=Stock.qty_kg + qty)
-        )
+        stock = await get_stock_row(s, w.id, p.id)
+        stock.qty_kg = Decimal(stock.qty_kg) + qty
 
         inc = Income(
             doc_date=doc_date,
@@ -3152,9 +2999,6 @@ async def inc_confirm(cq: CallbackQuery, state: FSMContext):
     await cq.answer()
 
 
-# -------------------------
-# Debtor wizard (kept mostly as-is, HTML confirm texts)
-# -------------------------
 async def start_debtor(message: Message, state: FSMContext):
     await state.clear()
     await set_menu(state, "reports")
@@ -3235,7 +3079,7 @@ async def deb_nav_handler(cq: CallbackQuery, state: FSMContext):
             await state.update_data(delivery="0")
             await state.set_state(DebtorWizard.confirm)
             data = await state.get_data()
-            await cq.message.answer(build_debtor_summary_html(data) + "\n\n<b>Подтвердить?</b>",
+            await cq.message.answer(build_debtor_summary(data) + "\n\nПодтвердить?",
                                    parse_mode=ParseMode.HTML,
                                    reply_markup=yes_no_kb("deb_confirm"))
         return await cq.answer()
@@ -3311,26 +3155,26 @@ async def deb_delivery(message: Message, state: FSMContext):
     await state.update_data(delivery=str(d))
     await state.set_state(DebtorWizard.confirm)
     data = await state.get_data()
-    await message.answer(build_debtor_summary_html(data) + "\n\n<b>Подтвердить?</b>",
+    await message.answer(build_debtor_summary(data) + "\n\nПодтвердить?",
                          parse_mode=ParseMode.HTML,
                          reply_markup=yes_no_kb("deb_confirm"))
 
 
-def build_debtor_summary_html(data: dict) -> str:
+def build_debtor_summary(data: dict) -> str:
     qty = Decimal(data["qty"])
     price = Decimal(data["price"])
     total = qty * price
     delivery = Decimal(data.get("delivery", "0"))
     return (
-        "📋 <b>ДОЛЖНИК (проверка)</b>\n"
-        f"Дата: <b>{h(data['doc_date'])}</b>\n"
-        f"Клиент: <b>{h(data.get('customer_name',''))}</b> / {h(data.get('customer_phone','-'))}\n"
-        f"Склад: <b>{h(data['warehouse_name'])}</b>\n"
-        f"Товар: <b>{h(data['product_name'])}</b>\n"
-        f"Кол-во: <b>{h(fmt_kg(qty))} кг</b>\n"
-        f"Цена: <b>{h(fmt_money(price))}</b>\n"
-        f"Сумма: <b>{h(fmt_money(total))}</b>\n"
-        f"Доставка: <b>{h(fmt_money(delivery))}</b>"
+        "📋 *ДОЛЖНИК (проверка):*\n"
+        f"Дата: *{data['doc_date']}*\n"
+        f"Клиент: *{data.get('customer_name','')}* / {data.get('customer_phone','-')}\n"
+        f"Склад: *{data['warehouse_name']}*\n"
+        f"Товар: *{data['product_name']}*\n"
+        f"Кол-во: *{fmt_kg(qty)} кг*\n"
+        f"Цена: *{fmt_money(price)}*\n"
+        f"Сумма: *{fmt_money(total)}*\n"
+        f"Доставка: *{fmt_money(delivery)}*"
     )
 
 
@@ -3372,9 +3216,6 @@ async def deb_confirm(cq: CallbackQuery, state: FSMContext):
     await cq.answer()
 
 
-# -------------------------
-# BOT START
-# -------------------------
 async def main():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -3387,7 +3228,7 @@ async def main():
             s.add(AllowedUser(user_id=OWNER_ID, created_at=datetime.utcnow(), added_by=OWNER_ID, note="owner"))
             await s.commit()
 
-    bot = Bot(TOKEN, parse_mode=ParseMode.HTML)
+    bot = Bot(TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
@@ -3398,3 +3239,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+
+
