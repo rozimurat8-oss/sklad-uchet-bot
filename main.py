@@ -1,5 +1,6 @@
 import os
 import asyncio
+import html
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
@@ -272,6 +273,10 @@ def safe_phone(s: str) -> str:
     return (s or "").strip()
 
 
+
+
+def h(s: str) -> str:
+    return html.escape((s or \"\").strip(), quote=False)
 def parse_cb(data: str, prefix: str):
     if not data or not data.startswith(prefix + ":"):
         return []
@@ -670,65 +675,49 @@ def user_manage_kb(uid: int, allowed: bool, back_page: int):
     return ikb.as_markup()
 
 
-async def render_users_page(page: int) -> tuple[str, list[User], bool, bool, set[int], int]:
+async def render_users_page(page: int) -> tuple[str, list[User], set[int]]:
     async with Session() as s:
         total = int(await s.scalar(select(func.count()).select_from(User)) or 0)
         if total == 0:
-            return "👥 Users: пока пусто.", [], False, False, set(), 0
+            return "👥 Users: пусто.", [], set()
 
-        if page < 0:
-            page = 0
+        page = max(page, 0)
+        users = (await s.execute(
+            select(User).order_by(User.created_at.desc()).offset(page * USERS_PAGE_SIZE).limit(USERS_PAGE_SIZE)
+        )).scalars().all()
 
-        max_page = max(0, (total - 1) // USERS_PAGE_SIZE)
-        if page > max_page:
-            page = max_page
-
-        stmt = (
-            select(User)
-            .order_by(User.created_at.desc())
-            .offset(page * USERS_PAGE_SIZE)
-            .limit(USERS_PAGE_SIZE)
-        )
-        users = (await s.execute(stmt)).scalars().all()
         allowed_ids = set((await s.execute(select(AllowedUser.user_id))).scalars().all())
 
-        has_prev = page > 0
-        has_next = page < max_page
-
-    lines = [f"👥 *Users* (всего: *{total}*), страница *{page+1}*:\n"]
+    lines = [f"👥 <b>Users</b> (всего: <b>{total}</b>), стр <b>{page+1}</b>:\n"]
     for u in users:
         st = "✅" if (u.user_id in allowed_ids or is_owner(u.user_id)) else "⛔"
-        uname = f"@{u.username}" if u.username else "-"
-        nm = u.name if u.name else "-"
-        fn = u.full_name if u.full_name else "-"
-        lines.append(
-            f"{st} *{u.user_id}* | {uname} | имя: *{nm}*\n"
-            f"└ {fn}"
-        )
+        uname = f"@{h(u.username)}" if u.username else "-"
+        nm = h(u.name) if u.name else "-"
+        fn = h(u.full_name) if u.full_name else "-"
+        lines.append(f"\n{st} <b>{u.user_id}</b> | {uname} | имя: <b>{nm}</b>\n└ {fn}")
 
-    return "\n\n".join(lines), users, has_prev, has_next, allowed_ids, page
-
+    return "\n".join(lines), users, allowed_ids
 
 async def render_user_card(uid: int) -> tuple[str, bool]:
     async with Session() as s:
         u = await s.get(User, int(uid))
         if not u:
-            return "User не найден (возможно удалён).", False
+            return "User не найден.", False
         allowed = bool(await s.scalar(select(AllowedUser.id).where(AllowedUser.user_id == int(uid))))
-    uname = f"@{u.username}" if u.username else "-"
-    nm = u.name if u.name else "-"
-    fn = u.full_name if u.full_name else "-"
+
+    uname = f"@{h(u.username)}" if u.username else "-"
+    nm = h(u.name) if u.name else "-"
+    fn = h(u.full_name) if u.full_name else "-"
     status = "✅ ДОСТУП ЕСТЬ" if (allowed or is_owner(u.user_id)) else "⛔ ДОСТУП НЕТ"
     txt = (
-        f"👤 *User {u.user_id}*\n"
-        f"Статус: *{status}*\n"
-        f"Username: *{uname}*\n"
-        f"Имя в системе: *{nm}*\n"
+        f"👤 <b>User {u.user_id}</b>\n"
+        f"Статус: <b>{status}</b>\n"
+        f"Username: <b>{uname}</b>\n"
+        f"Имя в системе: <b>{nm}</b>\n"
         f"Имя TG: {fn}\n"
-        f"Создан: `{u.created_at}`"
+        f"Создан: <code>{h(str(u.created_at))}</code>"
     )
     return txt, (allowed or is_owner(u.user_id))
-
 
 async def reply_in_menu(message: Message, state: FSMContext, text_: str, kb=None, parse_mode=None):
     ui = await get_ui_ctx(state)
@@ -1571,7 +1560,7 @@ async def users_inline_router(cq: CallbackQuery):
 
         txt, users, has_prev, has_next, allowed_ids, real_page = await render_users_page(page)
         if not users:
-            await cq.message.edit_text(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=None)
+            await cq.message.edit_text(txt, parse_mode=ParseMode.HTML, reply_markup=None)
             return await cq.answer()
 
         kb = users_list_kb(real_page, users, allowed_ids, has_prev, has_next)
@@ -1585,7 +1574,7 @@ async def users_inline_router(cq: CallbackQuery):
         back_page = int(parts[3])
 
         card, allowed = await render_user_card(uid)
-        await cq.message.edit_text(card, parse_mode=ParseMode.MARKDOWN, reply_markup=user_manage_kb(uid, allowed, back_page))
+        await cq.message.edit_text(card, parse_mode=ParseMode.HTML, reply_markup=user_manage_kb(uid, allowed, back_page))
         return await cq.answer()
 
     if action in ("allow", "deny", "rm"):
@@ -1615,7 +1604,7 @@ async def users_inline_router(cq: CallbackQuery):
             await deny_user(uid)
 
         card, allowed = await render_user_card(uid)
-        await cq.message.edit_text(card, parse_mode=ParseMode.MARKDOWN, reply_markup=user_manage_kb(uid, allowed, back_page))
+        await cq.message.edit_text(card, parse_mode=ParseMode.HTML, reply_markup=user_manage_kb(uid, allowed, back_page))
         return await cq.answer("OK")
 
     return await cq.answer()
@@ -1689,7 +1678,7 @@ async def menu_router(message: Message, state: FSMContext):
         page = 0
         txt, users, has_prev, has_next, allowed_ids, real_page = await render_users_page(page)
         kb = users_list_kb(real_page, users, allowed_ids, has_prev, has_next) if users else users_pager_kb(real_page, has_prev, has_next)
-        return await message.answer(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        return await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
 
     if text_ == BTN["rep_sales"]:
         await state.clear()
@@ -3258,3 +3247,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
