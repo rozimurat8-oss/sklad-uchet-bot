@@ -707,21 +707,21 @@ async def cmd_start(message: Message, state: FSMContext):
 
     await message.answer("⛔ У вас нет доступа. Запрос отправлен владельцу.")
     try:
+        username = f"@{message.from_user.username}" if message.from_user.username else "(нет)"
+        text = (
+            "🔐 Запрос доступа к боту\n"
+            f"ID: {uid}\n"
+            f"Имя: {safe_text(message.from_user.full_name)}\n"
+            f"Юзернейм: {username}"
+        )
         await message.bot.send_message(
             OWNER_ID,
-            f"🔐 Запрос доступа к боту
-"
-            f"ID: {uid}
-"
-            f"Имя: {safe_text(message.from_user.full_name)}
-"
-            f"Юзернейм: @{message.from_user.username}" if message.from_user.username else f"🔐 Запрос доступа к боту
-ID: {uid}
-Имя: {safe_text(message.from_user.full_name)}",
+            text,
             reply_markup=kb.as_markup()
         )
     except Exception:
         pass
+
 
 
 
@@ -2848,4 +2848,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
