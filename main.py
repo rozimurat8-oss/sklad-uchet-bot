@@ -17,7 +17,7 @@ from aiogram.enums.parse_mode import ParseMode
 
 from sqlalchemy import (
     String, Integer, Numeric, Date, DateTime, ForeignKey, Boolean,
-    select, func, delete, case, update, text
+    select, func, delete, case, update, text, else_
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -332,18 +332,23 @@ async def set_menu(state: FSMContext, menu: str):
     await state.update_data(cur_menu=menu)
 
 
+
+async def current_menu_kb(state: FSMContext, is_admin: bool):
+    data = await state.get_data()
+    if data.get("cur_menu") == "reports":
+        return reports_menu_kb(is_admin)
+    return main_menu_kb(is_admin)
+
+
 def main_menu_kb(is_admin: bool):
     kb = ReplyKeyboardBuilder()
-    kb.button(text="🟢 Приход")
-    kb.button(text="🔴 Продажа")
-    kb.adjust(2)
     kb.button(text="📦 Остатки")
     kb.button(text="💰 Деньги")
-    kb.adjust(2)
+    kb.button(text="🟢 Приход")
+    kb.button(text="🔴 Продажа")
     kb.button(text="📊 Отчеты")
-    kb.adjust(1)
     kb.button(text="❌ Отмена")
-    kb.adjust(1)
+    kb.adjust(2, 2, 1, 1)
     return kb.as_markup(resize_keyboard=True)
 
 
@@ -351,21 +356,19 @@ def reports_menu_kb(is_admin: bool):
     kb = ReplyKeyboardBuilder()
     kb.button(text="📄 Приходы")
     kb.button(text="📄 Продажи")
-    kb.adjust(2)
-    kb.button(text="📥 Выгрузка (таблица)")
+    kb.button(text="📥 Выгрузка")
     kb.button(text="📋 Должники")
-    kb.adjust(2)
-    kb.button(text="➕ Добавить должн...")
     kb.button(text="🏬 Склады")
-    kb.adjust(2)
     kb.button(text="🧺 Товары")
     kb.button(text="🏦 Банки")
-    kb.adjust(2)
     if is_admin:
         kb.button(text="👥 Users")
-        kb.adjust(2)
     kb.button(text="⬅️ Назад")
-    kb.adjust(1)
+    # 2 колонки почти везде, "Назад" отдельно
+    if is_admin:
+        kb.adjust(2, 2, 2, 2, 1)
+    else:
+        kb.adjust(2, 2, 2, 1)
     return kb.as_markup(resize_keyboard=True)
 
 
@@ -675,28 +678,44 @@ def user_manage_kb(uid: int, allowed: bool, back_page: int):
     return ikb.as_markup()
 
 
-async def render_users_page(page: int) -> tuple[str, list[User], set[int]]:
+async def render_users_page(page: int) -> tuple[str, list[User], bool, bool, set[int], int]:
     async with Session() as s:
         total = int(await s.scalar(select(func.count()).select_from(User)) or 0)
         if total == 0:
-            return "👥 Users: пусто.", [], set()
+            return "👥 Users: пусто.", [], False, False, set(), 0
 
-        page = max(page, 0)
+        if page < 0:
+            page = 0
+
+        max_page = (total - 1) // USERS_PAGE_SIZE
+        if page > max_page:
+            page = max_page
+
         users = (await s.execute(
-            select(User).order_by(User.created_at.desc()).offset(page * USERS_PAGE_SIZE).limit(USERS_PAGE_SIZE)
+            select(User)
+            .order_by(User.created_at.desc())
+            .offset(page * USERS_PAGE_SIZE)
+            .limit(USERS_PAGE_SIZE)
         )).scalars().all()
 
         allowed_ids = set((await s.execute(select(AllowedUser.user_id))).scalars().all())
 
-    lines = [f"👥 <b>Users</b> (всего: <b>{total}</b>), стр <b>{page+1}</b>:\n"]
+    has_prev = page > 0
+    has_next = page < max_page
+
+    lines = [f"👥 <b>Users</b> (всего: <b>{total}</b>), стр <b>{page+1}</b>:
+"]
     for u in users:
         st = "✅" if (u.user_id in allowed_ids or is_owner(u.user_id)) else "⛔"
         uname = f"@{h(u.username)}" if u.username else "-"
         nm = h(u.name) if u.name else "-"
         fn = h(u.full_name) if u.full_name else "-"
-        lines.append(f"\n{st} <b>{u.user_id}</b> | {uname} | имя: <b>{nm}</b>\n└ {fn}")
+        lines.append(f"{st} <b>{u.user_id}</b> | {uname} | имя: <b>{nm}</b>
+└ {fn}")
 
-    return "\n".join(lines), users, allowed_ids
+    return "
+
+".join(lines), users, has_prev, has_next, allowed_ids, page
 
 async def render_user_card(uid: int) -> tuple[str, bool]:
     async with Session() as s:
@@ -1167,6 +1186,7 @@ async def cb_sale_del(cq: CallbackQuery):
 
 
 async def list_sales(message: Message, state: FSMContext):
+    is_admin = is_owner(message.from_user.id)
     async with Session() as s:
         rows = (await s.execute(
             select(Sale)
@@ -1176,23 +1196,34 @@ async def list_sales(message: Message, state: FSMContext):
         )).scalars().all()
 
     if not rows:
-        return await reply_in_menu(message, state, "Продаж пока нет.")
+        return await message.answer("🔴 Продаж пока нет.", reply_markup=reports_menu_kb(is_admin))
 
-    lines = ["📄 *Последние продажи* (последние 30):"]
+    data_rows = []
     for r in rows:
         paid = "✅" if r.is_paid else "🧾"
-        acc = {"cash": "Нал", "bank": "Банк", "ip": "ИП"}.get(r.account_type, "-")
-        bank_name = (r.bank.name if r.bank else "")
-        where_txt = acc + (f" / {bank_name}" if bank_name else "")
-        lines.append(
-            f"\n*#{r.id}* {paid} {r.doc_date} — {r.customer_name} ({r.customer_phone})\n"
-            f"{r.warehouse.name} / {r.product.name} — {fmt_kg(r.qty_kg)} кг × {fmt_money(r.price_per_kg)} = *{fmt_money(r.total_amount)}*\n"
-            f"Куда: *{where_txt}*"
-        )
+        who = safe_text(r.customer_name) or "-"
+        wh = r.warehouse.name if r.warehouse else "-"
+        pr = r.product.name if r.product else "-"
+        data_rows.append([
+            str(r.id),
+            str(r.doc_date),
+            paid,
+            who,
+            fmt_kg(Decimal(r.qty_kg or 0)),
+            fmt_money(Decimal(r.price_per_kg or 0)),
+            fmt_money(Decimal(r.total_amount or 0)),
+        ])
 
-    await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-    await reply_in_menu(message, state, "Чтобы управлять: напиши `продажа #ID` например: `продажа #12`",
-                        parse_mode=ParseMode.MARKDOWN)
+    txt = "🔴 Продажи (последние 30):
+" + _render_pre_table(
+        headers=["ID", "Дата", "Опл", "Клиент", "Кг", "Цена/кг", "Сумма"],
+        rows=data_rows
+    )
+    await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=reports_menu_kb(is_admin))
+    await message.answer("Чтобы управлять: напиши <code>продажа #ID</code> (пример: <code>продажа #12</code>)",
+                         parse_mode=ParseMode.HTML,
+                         reply_markup=reports_menu_kb(is_admin))
+
 
 
 @router.message(F.text.regexp(r"(?i)^продажа\s+#\d+$"))
@@ -1252,6 +1283,7 @@ async def cb_inc_del(cq: CallbackQuery):
 
 
 async def list_incomes(message: Message, state: FSMContext):
+    is_admin = is_owner(message.from_user.id)
     async with Session() as s:
         rows = (await s.execute(
             select(Income)
@@ -1261,22 +1293,36 @@ async def list_incomes(message: Message, state: FSMContext):
         )).scalars().all()
 
     if not rows:
-        return await reply_in_menu(message, state, "Приходов пока нет.")
+        return await message.answer("🟢 Приходов пока нет.", reply_markup=reports_menu_kb(is_admin))
 
-    lines = ["📄 *Последние приходы* (последние 30):"]
+    data_rows = []
     for r in rows:
-        acc = {"cash": "Нал", "bank": "Банк", "ip": "ИП"}.get(r.account_type, "-")
-        bank_name = (r.bank.name if r.bank else "")
-        where_txt = acc + (f" / {bank_name}" if bank_name else "")
-        lines.append(
-            f"\n*#{r.id}* {r.doc_date} — {r.supplier_name} ({r.supplier_phone})\n"
-            f"{r.warehouse.name} / {r.product.name} — {fmt_kg(r.qty_kg)} кг × {fmt_money(r.price_per_kg)} = *{fmt_money(r.total_amount)}*\n"
-            f"Расход денег: *{'✅' if r.add_money_entry else '❌'}* | Куда: *{where_txt}*"
-        )
+        wh = r.warehouse.name if r.warehouse else "-"
+        pr = r.product.name if r.product else "-"
+        supplier = safe_text(r.supplier_name) or "-"
+        add_money = "✅" if r.add_money_entry else "❌"
+        data_rows.append([
+            str(r.id),
+            str(r.doc_date),
+            supplier,
+            wh,
+            pr,
+            fmt_kg(Decimal(r.qty_kg or 0)),
+            fmt_money(Decimal(r.price_per_kg or 0)),
+            fmt_money(Decimal(r.total_amount or 0)),
+            add_money
+        ])
 
-    await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-    await reply_in_menu(message, state, "Чтобы посмотреть: напиши `приход #ID` например: `приход #7`",
-                        parse_mode=ParseMode.MARKDOWN)
+    txt = "🟢 Приходы (последние 30):
+" + _render_pre_table(
+        headers=["ID", "Дата", "Поставщик", "Склад", "Товар", "Кг", "Цена/кг", "Сумма", "Расх"],
+        rows=data_rows
+    )
+    await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=reports_menu_kb(is_admin))
+    await message.answer("Чтобы посмотреть: напиши <code>приход #ID</code> (пример: <code>приход #7</code>)",
+                         parse_mode=ParseMode.HTML,
+                         reply_markup=reports_menu_kb(is_admin))
+
 
 
 @router.message(F.text.regexp(r"(?i)^приход\s+#\d+$"))
@@ -1350,23 +1396,37 @@ async def cb_deb_del(cq: CallbackQuery):
 
 
 async def list_debtors(message: Message, state: FSMContext):
+    is_admin = is_owner(message.from_user.id)
     async with Session() as s:
         rows = (await s.execute(select(Debtor).order_by(Debtor.id.desc()).limit(50))).scalars().all()
 
     if not rows:
-        return await reply_in_menu(message, state, "Должников нет ✅")
+        return await message.answer("✅ Должников нет.", reply_markup=reports_menu_kb(is_admin))
 
-    lines = ["📋 *Должники* (последние 50):"]
+    data_rows = []
     for r in rows:
         status = "✅" if r.is_paid else "🧾"
-        lines.append(
-            f"\n*#{r.id}* {status} {r.doc_date} — {r.customer_name} ({r.customer_phone})\n"
-            f"{r.warehouse_name} / {r.product_name} — {fmt_kg(r.qty_kg)} кг × {fmt_money(r.price_per_kg)} = *{fmt_money(r.total_amount)}*"
-        )
+        who = safe_text(r.customer_name) or "-"
+        data_rows.append([
+            str(r.id),
+            str(r.doc_date),
+            status,
+            who,
+            safe_text(r.warehouse_name) or "-",
+            safe_text(r.product_name) or "-",
+            fmt_money(Decimal(r.total_amount or 0)),
+        ])
 
-    await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-    await reply_in_menu(message, state, "Чтобы управлять: напиши `должник #ID` например: `должник #3`",
-                        parse_mode=ParseMode.MARKDOWN)
+    txt = "📋 Должники (последние 50):
+" + _render_pre_table(
+        headers=["ID", "Дата", "Ст", "Клиент", "Склад", "Товар", "Долг"],
+        rows=data_rows
+    )
+    await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=reports_menu_kb(is_admin))
+    await message.answer("Чтобы управлять: напиши <code>должник #ID</code> (пример: <code>должник #3</code>)",
+                         parse_mode=ParseMode.HTML,
+                         reply_markup=reports_menu_kb(is_admin))
+
 
 
 @router.message(F.text.regexp(r"(?i)^должник\s+#\d+$"))
@@ -1496,7 +1556,7 @@ async def cmd_users(message: Message, state: FSMContext):
     page = 0
     txt, users, has_prev, has_next, allowed_ids, real_page = await render_users_page(page)
     kb = users_list_kb(real_page, users, allowed_ids, has_prev, has_next) if users else users_pager_kb(real_page, has_prev, has_next)
-    await message.answer(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 @router.message(Command("allow"))
@@ -1564,7 +1624,7 @@ async def users_inline_router(cq: CallbackQuery):
             return await cq.answer()
 
         kb = users_list_kb(real_page, users, allowed_ids, has_prev, has_next)
-        await cq.message.edit_text(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        await cq.message.edit_text(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
         return await cq.answer()
 
     if action == "manage":
@@ -3247,5 +3307,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
