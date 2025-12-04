@@ -32,14 +32,20 @@ if not TOKEN:
 
 DB_URL = os.getenv("DB_URL", "sqlite+aiosqlite:////var/data/data.db")
 
+OWNER_ID = int(os.getenv("OWNER_ID", "39099578") or 0)
+
 ADMIN_USER_IDS = set(
     int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",")
     if x.strip().isdigit()
 )
 
+# OWNER is always allowed (even if ADMIN_USER_IDS is empty/misconfigured)
+ADMIN_USER_IDS.add(OWNER_ID)
+
 print("=== BOOT ===", flush=True)
 print("TOKEN set:", bool(TOKEN), flush=True)
 print("DB_URL:", DB_URL, flush=True)
+print("OWNER_ID:", OWNER_ID, flush=True)
 
 
 # ===================== DB models =====================
@@ -169,13 +175,56 @@ class Debtor(Base):
     is_paid: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class AllowedUser(Base):
+    __tablename__ = "allowed_users"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    added_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    added_by: Mapped[int] = mapped_column(Integer, default=0)
+    note: Mapped[str] = mapped_column(String(300), default="")
+
+
+
+# ===================== Light migrations (SQLite) =====================
+async def ensure_allowed_users_schema(conn):
+    # Create table if not exists
+    await conn.exec_driver_sql(
+        """
+        CREATE TABLE IF NOT EXISTS allowed_users (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL UNIQUE,
+            added_at DATETIME,
+            added_by INTEGER,
+            note VARCHAR(300)
+        )
+        """
+    )
+
+    # Add missing columns (older DB may have only id/user_id)
+    cols = [row[1] for row in (await conn.exec_driver_sql("PRAGMA table_info(allowed_users)")).fetchall()]
+    if "added_at" not in cols:
+        await conn.exec_driver_sql("ALTER TABLE allowed_users ADD COLUMN added_at DATETIME")
+    if "added_by" not in cols:
+        await conn.exec_driver_sql("ALTER TABLE allowed_users ADD COLUMN added_by INTEGER")
+    if "note" not in cols:
+        await conn.exec_driver_sql("ALTER TABLE allowed_users ADD COLUMN note VARCHAR(300)")
+
 engine = create_async_engine(DB_URL, echo=False)
 Session = async_sessionmaker(engine, expire_on_commit=False)
 
 
 # ===================== Helpers =====================
 def is_admin(user_id: int) -> bool:
-    return (not ADMIN_USER_IDS) or (user_id in ADMIN_USER_IDS)
+    # Owner always allowed. Others must be in AllowedUser.
+    return int(user_id) == int(OWNER_ID)
+
+
+async def is_allowed(user_id: int) -> bool:
+    if int(user_id) == int(OWNER_ID):
+        return True
+    async with Session() as s:
+        return bool(await s.scalar(select(AllowedUser.id).where(AllowedUser.user_id == int(user_id))))
+
 
 
 def dec(s: str) -> Decimal:
@@ -534,7 +583,7 @@ async def pick_bank_kb(prefix: str):
 # ===================== Menu handler =====================
 @router.message(F.text.in_(MENU_TEXTS))
 async def menu_anywhere(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+    if not (await is_allowed(message.from_user.id)):
         return await message.answer("Нет доступа.")
 
     text = message.text
@@ -644,11 +693,74 @@ async def menu_anywhere(message: Message, state: FSMContext):
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return await message.answer("Нет доступа.")
     await state.clear()
-    await message.answer("Привет! Выбери действие:", reply_markup=main_menu_kb())
 
+    uid = message.from_user.id
+    if await is_allowed(uid):
+        return await message.answer("Привет! Выбери действие:", reply_markup=main_menu_kb())
+
+    # запрос доступа владельцу
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Разрешить", callback_data=f"acc_req:allow:{uid}")
+    kb.button(text="❌ Запретить", callback_data=f"acc_req:deny:{uid}")
+    kb.adjust(2)
+
+    await message.answer("⛔ У вас нет доступа. Запрос отправлен владельцу.")
+    try:
+        await message.bot.send_message(
+            OWNER_ID,
+            f"🔐 Запрос доступа к боту
+"
+            f"ID: {uid}
+"
+            f"Имя: {safe_text(message.from_user.full_name)}
+"
+            f"Юзернейм: @{message.from_user.username}" if message.from_user.username else f"🔐 Запрос доступа к боту
+ID: {uid}
+Имя: {safe_text(message.from_user.full_name)}",
+            reply_markup=kb.as_markup()
+        )
+    except Exception:
+        pass
+
+
+
+
+
+# ===================== Access control =====================
+@router.callback_query(F.data.startswith("acc_req:"))
+async def cb_access_req(cq: CallbackQuery):
+    # only owner can press
+    if cq.from_user.id != OWNER_ID:
+        return await cq.answer("Нет доступа", show_alert=True)
+
+    parts = (cq.data or "").split(":")
+    if len(parts) != 3:
+        return await cq.answer("Ошибка", show_alert=True)
+    _, action, uid_s = parts
+    if not uid_s.isdigit():
+        return await cq.answer("Ошибка", show_alert=True)
+    uid = int(uid_s)
+
+    async with Session() as s:
+        exists = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == uid))
+        if action == "allow":
+            if not exists:
+                s.add(AllowedUser(user_id=uid, added_by=OWNER_ID, note="approved"))
+                await s.commit()
+            await cq.message.edit_text(f"✅ Доступ разрешён пользователю {uid}")
+            try:
+                await cq.bot.send_message(uid, "✅ Вам выдан доступ к боту. Напишите /start")
+            except Exception:
+                pass
+            return await cq.answer("Ок")
+        else:
+            await cq.message.edit_text(f"❌ Доступ отклонён пользователю {uid}")
+            try:
+                await cq.bot.send_message(uid, "⛔ Доступ к боту не выдан.")
+            except Exception:
+                pass
+            return await cq.answer("Ок")
 
 # ===================== Warehouses Admin =====================
 @router.message(WarehousesAdmin.adding)
@@ -2715,6 +2827,15 @@ async def deb_confirm(cq: CallbackQuery, state: FSMContext):
 async def main():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # migrations for allowed_users table / columns
+        await ensure_allowed_users_schema(conn)
+
+    # ensure owner is in allowed_users (optional but useful for listing)
+    async with Session() as s:
+        exists = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == OWNER_ID))
+        if not exists:
+            s.add(AllowedUser(user_id=OWNER_ID, added_by=OWNER_ID, note="owner"))
+            await s.commit()
 
     bot = Bot(TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
@@ -2727,5 +2848,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
 
