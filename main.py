@@ -2180,6 +2180,11 @@ SALE_FLOW = [
     "qty", "price", "delivery", "paid_status", "pay_method", "account_type", "bank_pick", "confirm"
 ]
 
+INCOME_FLOW = [
+    "doc_date", "supplier_name", "supplier_phone", "warehouse_id", "product_id",
+    "qty", "price", "delivery", "add_money", "pay_method", "account_type", "bank_pick", "confirm"
+]
+
 
 def sale_state_name(state: State) -> str:
     return str(state).split(":")[-1]
