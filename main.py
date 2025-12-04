@@ -35,7 +35,7 @@ DB_URL = os.getenv("DB_URL", "sqlite+aiosqlite:////var/data/data.db")
 ADMIN_USER_IDS = set(
     int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",")
 
-OWNER_ID = int(os.getenv("OWNER_ID", "39099578") or 0)
+OWNER_ID = int(os.getenv("OWNER_ID", "139099578") or 0)
     if x.strip().isdigit()
 )
 
@@ -2851,3 +2851,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
