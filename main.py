@@ -827,25 +827,6 @@ async def recalc_money_ledger(session):
     await session.flush()
 
 
-    mvs = (await session.execute(select(MoneyMovement).order_by(MoneyMovement.id))).scalars().all()
-    for mv in mvs:
-        amt = Decimal(mv.amount or 0)
-        direction = "in" if amt >= 0 else "out"
-        session.add(MoneyLedger(
-            entry_date=mv.entry_date,
-            direction=direction,
-            method=mv.method or ("cash" if mv.account_type == "cash" else "noncash"),
-            account_type=mv.account_type,
-            bank_id=mv.bank_id,
-            amount=abs(amt),
-            note=mv.note or f"{mv.doc_type}#{mv.doc_id}"
-        ))
-    await session.flush()
-    row = Stock(warehouse_id=warehouse_id, product_id=product_id, qty_kg=Decimal("0"))
-    session.add(row)
-    await session.flush()
-    return row
-
 
 async def pick_warehouse_kb(prefix: str):
     async with Session() as s:
