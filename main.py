@@ -1863,6 +1863,7 @@ async def start_debtor(message: Message, state: FSMContext):
     await message.answer("Дата (для должника):", reply_markup=choose_date_kb("deb"))
 
 
+@router.message(F.text)
 async def menu_router(message: Message, state: FSMContext):
     uid = message.from_user.id
     await upsert_user_from_tg(message.from_user)
