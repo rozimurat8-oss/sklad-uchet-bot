@@ -667,28 +667,39 @@ def user_manage_kb(uid: int, allowed: bool, back_page: int):
     return ikb.as_markup()
 
 
-async def render_users_page(page: int) -> tuple[str, list[User], set[int]]:
+async def render_users_page(page: int) -> tuple[str, list[User], set[int], bool, bool, int, int]:
     async with Session() as s:
         total = int(await s.scalar(select(func.count()).select_from(User)) or 0)
         if total == 0:
-            return "👥 Users: пусто.", [], set()
+            return "👥 Users: пусто.", [], set(), False, False, 0, 0
 
-        page = max(page, 0)
+        page = max(int(page), 0)
+        max_page = max((total - 1) // USERS_PAGE_SIZE, 0)
+        real_page = min(page, max_page)
+
         users = (await s.execute(
-            select(User).order_by(User.created_at.desc()).offset(page * USERS_PAGE_SIZE).limit(USERS_PAGE_SIZE)
+            select(User).order_by(User.created_at.desc()).offset(real_page * USERS_PAGE_SIZE).limit(USERS_PAGE_SIZE)
         )).scalars().all()
 
         allowed_ids = set((await s.execute(select(AllowedUser.user_id))).scalars().all())
 
-    lines = [f"👥 <b>Users</b> (всего: <b>{total}</b>), стр <b>{page+1}</b>:\n"]
+    has_prev = real_page > 0
+    has_next = (real_page + 1) * USERS_PAGE_SIZE < total
+
+    lines = [f"👥 <b>Users</b> (всего: <b>{total}</b>), стр <b>{real_page+1}</b> из <b>{max_page+1}</b>:
+"]
     for u in users:
         st = "✅" if (u.user_id in allowed_ids or is_owner(u.user_id)) else "⛔"
         uname = f"@{h(u.username)}" if u.username else "-"
         nm = h(u.name) if u.name else "-"
         fn = h(u.full_name) if u.full_name else "-"
-        lines.append(f"\n{st} <b>{u.user_id}</b> | {uname} | имя: <b>{nm}</b>\n└ {fn}")
+        lines.append(f"
+{st} <b>{u.user_id}</b> | {uname} | имя: <b>{nm}</b>
+└ {fn}")
 
-    return "\n".join(lines), users, allowed_ids
+    return "
+".join(lines), users, allowed_ids, has_prev, has_next, real_page, total
+
 
 async def render_user_card(uid: int) -> tuple[str, bool]:
     async with Session() as s:
@@ -858,20 +869,20 @@ async def show_money(message: Message, state: FSMContext):
     bank_lines.sort(key=lambda x: x[0].lower())
     ip_lines.sort(key=lambda x: x[0].lower())
 
-    txt = ["💰 *Деньги (балансы):*",
-           f"\n💵 *Наличные:* *{fmt_money(cash_balance)}*"]
+    txt = ["💰 <b>Деньги (балансы):</b>",
+           f"\n💵 <b>Наличные:</b> <b>{fmt_money(cash_balance)}</b>"]
 
-    txt.append("\n🏦 *Банки:*")
+    txt.append("\n🏦 <b>Банки:</b>")
     if bank_lines:
         for name, bal in bank_lines:
-            txt.append(f"• {name}: *{fmt_money(bal)}*")
+            txt.append(f"• {h(name)}: <b>{fmt_money(bal)}</b>")
     else:
         txt.append("• (пусто)")
 
-    txt.append("\n👤 *Счёт ИП:*")
+    txt.append("\n👤 <b>Счёт ИП:</b>")
     if ip_lines:
         for name, bal in ip_lines:
-            txt.append(f"• {name}: *{fmt_money(bal)}*")
+            txt.append(f"• {h(name)}: <b>{fmt_money(bal)}</b>")
     else:
         txt.append("• (пусто)")
 
@@ -1164,27 +1175,36 @@ async def list_sales(message: Message, state: FSMContext):
             select(Sale)
             .options(selectinload(Sale.warehouse), selectinload(Sale.product), selectinload(Sale.bank))
             .order_by(Sale.id.desc())
-            .limit(30)
+            .limit(50)
         )).scalars().all()
 
     if not rows:
         return await reply_in_menu(message, state, "Продаж пока нет.")
 
-    lines = ["📄 *Последние продажи* (последние 30):"]
+    table_rows = []
     for r in rows:
         paid = "✅" if r.is_paid else "🧾"
-        acc = {"cash": "Нал", "bank": "Банк", "ip": "ИП"}.get(r.account_type, "-")
-        bank_name = (r.bank.name if r.bank else "")
-        where_txt = acc + (f" / {bank_name}" if bank_name else "")
-        lines.append(
-            f"\n*#{r.id}* {paid} {r.doc_date} — {r.customer_name} ({r.customer_phone})\n"
-            f"{r.warehouse.name} / {r.product.name} — {fmt_kg(r.qty_kg)} кг × {fmt_money(r.price_per_kg)} = *{fmt_money(r.total_amount)}*\n"
-            f"Куда: *{where_txt}*"
-        )
+        who = safe_text(r.customer_name) or "-"
+        table_rows.append([
+            str(r.id),
+            str(r.doc_date),
+            who,
+            r.warehouse.name if r.warehouse else "-",
+            r.product.name if r.product else "-",
+            fmt_kg(Decimal(r.qty_kg or 0)),
+            fmt_money(Decimal(r.total_amount or 0)),
+            paid
+        ])
 
-    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+    txt = "📄 Продажи (последние 50):
+" + _render_pre_table(
+        headers=["ID", "Дата", "Клиент", "Склад", "Товар", "кг", "Сумма", "Опл"],
+        rows=table_rows
+    )
+    await message.answer(txt, parse_mode=ParseMode.HTML)
     await reply_in_menu(message, state, "Чтобы управлять: напиши `продажа #ID` например: `продажа #12`",
                         parse_mode=ParseMode.HTML)
+
 
 
 @router.message(F.text.regexp(r"(?i)^продажа\s+#\d+$"))
@@ -1249,26 +1269,34 @@ async def list_incomes(message: Message, state: FSMContext):
             select(Income)
             .options(selectinload(Income.warehouse), selectinload(Income.product), selectinload(Income.bank))
             .order_by(Income.id.desc())
-            .limit(30)
+            .limit(50)
         )).scalars().all()
 
     if not rows:
         return await reply_in_menu(message, state, "Приходов пока нет.")
 
-    lines = ["📄 *Последние приходы* (последние 30):"]
+    table_rows = []
     for r in rows:
-        acc = {"cash": "Нал", "bank": "Банк", "ip": "ИП"}.get(r.account_type, "-")
-        bank_name = (r.bank.name if r.bank else "")
-        where_txt = acc + (f" / {bank_name}" if bank_name else "")
-        lines.append(
-            f"\n*#{r.id}* {r.doc_date} — {r.supplier_name} ({r.supplier_phone})\n"
-            f"{r.warehouse.name} / {r.product.name} — {fmt_kg(r.qty_kg)} кг × {fmt_money(r.price_per_kg)} = *{fmt_money(r.total_amount)}*\n"
-            f"Расход денег: *{'✅' if r.add_money_entry else '❌'}* | Куда: *{where_txt}*"
-        )
+        table_rows.append([
+            str(r.id),
+            str(r.doc_date),
+            safe_text(r.supplier_name) or "-",
+            r.warehouse.name if r.warehouse else "-",
+            r.product.name if r.product else "-",
+            fmt_kg(Decimal(r.qty_kg or 0)),
+            fmt_money(Decimal(r.total_amount or 0)),
+            ("✅" if r.add_money_entry else "❌")
+        ])
 
-    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+    txt = "📄 Приходы (последние 50):
+" + _render_pre_table(
+        headers=["ID", "Дата", "Поставщик", "Склад", "Товар", "кг", "Сумма", "Расх"],
+        rows=table_rows
+    )
+    await message.answer(txt, parse_mode=ParseMode.HTML)
     await reply_in_menu(message, state, "Чтобы посмотреть: напиши `приход #ID` например: `приход #7`",
                         parse_mode=ParseMode.HTML)
+
 
 
 @router.message(F.text.regexp(r"(?i)^приход\s+#\d+$"))
@@ -1348,17 +1376,29 @@ async def list_debtors(message: Message, state: FSMContext):
     if not rows:
         return await reply_in_menu(message, state, "Должников нет ✅")
 
-    lines = ["📋 *Должники* (последние 50):"]
+    table_rows = []
     for r in rows:
         status = "✅" if r.is_paid else "🧾"
-        lines.append(
-            f"\n*#{r.id}* {status} {r.doc_date} — {r.customer_name} ({r.customer_phone})\n"
-            f"{r.warehouse_name} / {r.product_name} — {fmt_kg(r.qty_kg)} кг × {fmt_money(r.price_per_kg)} = *{fmt_money(r.total_amount)}*"
-        )
+        table_rows.append([
+            str(r.id),
+            str(r.doc_date),
+            safe_text(r.customer_name) or "-",
+            r.warehouse_name or "-",
+            r.product_name or "-",
+            fmt_kg(Decimal(r.qty_kg or 0)),
+            fmt_money(Decimal(r.total_amount or 0)),
+            status
+        ])
 
-    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+    txt = "📋 Должники (последние 50):
+" + _render_pre_table(
+        headers=["ID", "Дата", "Клиент", "Склад", "Товар", "кг", "Сумма", "Ст"],
+        rows=table_rows
+    )
+    await message.answer(txt, parse_mode=ParseMode.HTML)
     await reply_in_menu(message, state, "Чтобы управлять: напиши `должник #ID` например: `должник #3`",
                         parse_mode=ParseMode.HTML)
+
 
 
 @router.message(F.text.regexp(r"(?i)^должник\s+#\d+$"))
@@ -1486,7 +1526,7 @@ async def cmd_users(message: Message, state: FSMContext):
         return await message.answer("Нет доступа.")
     await set_menu(state, "reports")
     page = 0
-    txt, users, has_prev, has_next, allowed_ids, real_page = await render_users_page(page)
+    txt, users, allowed_ids, has_prev, has_next, real_page, _total = await render_users_page(page)
     kb = users_list_kb(real_page, users, allowed_ids, has_prev, has_next) if users else users_pager_kb(real_page, has_prev, has_next)
     await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -1550,7 +1590,7 @@ async def users_inline_router(cq: CallbackQuery):
         if page < 0:
             page = 0
 
-        txt, users, has_prev, has_next, allowed_ids, real_page = await render_users_page(page)
+        txt, users, allowed_ids, has_prev, has_next, real_page, _total = await render_users_page(page)
         if not users:
             await cq.message.edit_text(txt, parse_mode=ParseMode.HTML, reply_markup=None)
             return await cq.answer()
@@ -1668,7 +1708,7 @@ async def menu_router(message: Message, state: FSMContext):
         if not is_admin:
             return await message.answer("Нет доступа.", reply_markup=reports_menu_kb(is_admin))
         page = 0
-        txt, users, has_prev, has_next, allowed_ids, real_page = await render_users_page(page)
+        txt, users, allowed_ids, has_prev, has_next, real_page, _total = await render_users_page(page)
         kb = users_list_kb(real_page, users, allowed_ids, has_prev, has_next) if users else users_pager_kb(real_page, has_prev, has_next)
         return await message.answer(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -3228,7 +3268,7 @@ async def main():
             s.add(AllowedUser(user_id=OWNER_ID, created_at=datetime.utcnow(), added_by=OWNER_ID, note="owner"))
             await s.commit()
 
-    bot = Bot(TOKEN)
+    bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
@@ -3239,7 +3279,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
 
 
 
