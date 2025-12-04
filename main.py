@@ -1884,7 +1884,7 @@ async def start_debtor(message: Message, state: FSMContext):
     await message.answer("Дата (для должника):", reply_markup=choose_date_kb("deb"))
 
 
-def interrupt_kb() -> ReplyKeyboardMarkup:
+def interrupt_kb():
     buttons = [
         [KeyboardButton(text="❌ Отмена"), KeyboardButton(text="↩️ Продолжить")]
     ]
