@@ -1,8 +1,9 @@
+import re
 import os
 import asyncio
 import html
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from dotenv import load_dotenv
 
@@ -292,7 +293,20 @@ async def ensure_users_schema(conn):
 
 
 def dec(s: str) -> Decimal:
-    s = (s or "").strip().replace(",", ".")
+    s = (s or "").strip()
+    # allow inputs like "10,5", "10.5", "10 кг", "₸ 1200", "1 200.50"
+    s = s.replace("₸", "").replace("тг", "").replace("тенге", "")
+    s = s.replace("кг", "").replace("kg", "").replace("KG", "")
+    s = s.replace(" ", "")
+    s = s.replace(",", ".")
+    # keep only leading sign + digits + dot
+    m = re.match(r"^[+-]?[0-9]*([.][0-9]*)?$", s)
+    if not m:
+        # try to extract first number from messy text
+        m2 = re.search(r"[+-]?[0-9]+([.,][0-9]+)?", (s or ""))
+        if not m2:
+            raise InvalidOperation
+        s = m2.group(0).replace(",", ".")
     return Decimal(s)
 
 
