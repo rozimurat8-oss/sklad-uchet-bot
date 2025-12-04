@@ -32,15 +32,12 @@ if not TOKEN:
 
 DB_URL = os.getenv("DB_URL", "sqlite+aiosqlite:////var/data/data.db")
 
-OWNER_ID = int(os.getenv("OWNER_ID", "39099578") or 0)
-
 ADMIN_USER_IDS = set(
     int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",")
+
+OWNER_ID = int(os.getenv("OWNER_ID", "39099578") or 0)
     if x.strip().isdigit()
 )
-
-# OWNER is always allowed (even if ADMIN_USER_IDS is empty/misconfigured)
-ADMIN_USER_IDS.add(OWNER_ID)
 
 print("=== BOOT ===", flush=True)
 print("TOKEN set:", bool(TOKEN), flush=True)
@@ -179,6 +176,7 @@ class AllowedUser(Base):
     __tablename__ = "allowed_users"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    added_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     added_by: Mapped[int] = mapped_column(Integer, default=0)
     note: Mapped[str] = mapped_column(String(300), default="")
@@ -193,6 +191,7 @@ async def ensure_allowed_users_schema(conn):
         CREATE TABLE IF NOT EXISTS allowed_users (
             id INTEGER PRIMARY KEY,
             user_id INTEGER NOT NULL UNIQUE,
+            added_at DATETIME,
             created_at DATETIME,
             added_by INTEGER,
             note VARCHAR(300)
@@ -202,6 +201,8 @@ async def ensure_allowed_users_schema(conn):
 
     # Add missing columns (older DB may have only id/user_id)
     cols = [row[1] for row in (await conn.exec_driver_sql("PRAGMA table_info(allowed_users)")).fetchall()]
+    if "added_at" not in cols:
+        await conn.exec_driver_sql("ALTER TABLE allowed_users ADD COLUMN added_at DATETIME")
     if "created_at" not in cols:
         await conn.exec_driver_sql("ALTER TABLE allowed_users ADD COLUMN created_at DATETIME")
     if "added_by" not in cols:
@@ -209,14 +210,8 @@ async def ensure_allowed_users_schema(conn):
     if "note" not in cols:
         await conn.exec_driver_sql("ALTER TABLE allowed_users ADD COLUMN note VARCHAR(300)")
 
-    # Fill NULL created_at (legacy rows)
-    try:
-        await conn.exec_driver_sql(
-            "UPDATE allowed_users SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP) WHERE created_at IS NULL"
-        )
-    except Exception:
-        pass
-
+    # Backfill for NOT NULL constraints / older rows
+    await conn.exec_driver_sql("UPDATE allowed_users SET created_at = COALESCE(created_at, added_at, CURRENT_TIMESTAMP) WHERE created_at IS NULL")
 engine = create_async_engine(DB_URL, echo=False)
 Session = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -715,21 +710,21 @@ async def cmd_start(message: Message, state: FSMContext):
 
     await message.answer("⛔ У вас нет доступа. Запрос отправлен владельцу.")
     try:
-        username = f"@{message.from_user.username}" if message.from_user.username else "(нет)"
-        text = (
-            "🔐 Запрос доступа к боту\n"
-            f"ID: {uid}\n"
-            f"Имя: {safe_text(message.from_user.full_name)}\n"
-            f"Юзернейм: {username}"
-        )
         await message.bot.send_message(
             OWNER_ID,
-            text,
+            f"🔐 Запрос доступа к боту
+"
+            f"ID: {uid}
+"
+            f"Имя: {safe_text(message.from_user.full_name)}
+"
+            f"Юзернейм: @{message.from_user.username}" if message.from_user.username else f"🔐 Запрос доступа к боту
+ID: {uid}
+Имя: {safe_text(message.from_user.full_name)}",
             reply_markup=kb.as_markup()
         )
     except Exception:
         pass
-
 
 
 
@@ -2856,6 +2851,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
