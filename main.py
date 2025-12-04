@@ -1,6 +1,7 @@
 import os
 import asyncio
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from decimal import Decimal
 
 from dotenv import load_dotenv
@@ -37,6 +38,12 @@ ADMIN_USER_IDS = set(
     if x.strip().isdigit()
 )
 
+OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")  # кому слать бэкап (если ADMIN_USER_IDS пуст)
+AUTO_BACKUP = (os.getenv("AUTO_BACKUP", "1").strip() != "0")
+BACKUP_TIME_HHMM = os.getenv("BACKUP_TIME_HHMM", "23:50")  # по времени Астаны
+TZ_NAME = os.getenv("TZ_NAME", "Asia/Almaty")
+
+
 print("=== BOOT ===", flush=True)
 print("TOKEN set:", bool(TOKEN), flush=True)
 print("DB_URL:", DB_URL, flush=True)
@@ -63,6 +70,14 @@ class Bank(Base):
     __tablename__ = "banks"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+
+class AllowedUser(Base):
+    __tablename__ = "allowed_users"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    added_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    note: Mapped[str] = mapped_column(String(200), default="")
 
 
 class Stock(Base):
@@ -175,7 +190,22 @@ Session = async_sessionmaker(engine, expire_on_commit=False)
 
 # ===================== Helpers =====================
 def is_admin(user_id: int) -> bool:
-    return (not ADMIN_USER_IDS) or (user_id in ADMIN_USER_IDS)
+    # Админов задаём через переменную окружения ADMIN_USER_IDS="111,222"
+    # или OWNER_ID="111"
+    return (user_id in ADMIN_USER_IDS) or (OWNER_ID and user_id == OWNER_ID)
+
+async def is_allowed(user_id: int) -> bool:
+    # Если OWNER_ID или ADMIN_USER_IDS заданы — включаем белый список
+    whitelist_enabled = bool(OWNER_ID) or bool(ADMIN_USER_IDS)
+    if not whitelist_enabled:
+        return True  # доступ всем (как раньше)
+
+    if is_admin(user_id):
+        return True
+
+    async with Session() as s:
+        exists = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == user_id))
+        return bool(exists)
 
 
 def dec(s: str) -> Decimal:
@@ -239,6 +269,12 @@ def main_menu_kb():
     kb.adjust(2)
 
     kb.button(text="🏦 Банки")
+    kb.adjust(1)
+
+    kb.button(text="⬇️ Скачать БД")
+    kb.adjust(1)
+
+    kb.button(text="👥 Доступ")
     kb.adjust(1)
 
     kb.button(text="❌ Отмена")
@@ -455,6 +491,7 @@ MENU_TEXTS = {
     "📥 Выгрузка (таблица)",  # NEW
     "📋 Должники", "➕ Добавить должн...",
     "🏬 Склады", "🧺 Товары", "🏦 Банки",
+    "⬇️ Скачать БД", "👥 Доступ",
     "❌ Отмена",
     "➕ Добавить склад", "📃 Список складов", "🗑 Удалить склад",
     "➕ Добавить товар", "📃 Список товаров", "🗑 Удалить товар",
@@ -534,8 +571,8 @@ async def pick_bank_kb(prefix: str):
 # ===================== Menu handler =====================
 @router.message(F.text.in_(MENU_TEXTS))
 async def menu_anywhere(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return await message.answer("Нет доступа.")
+    if not await is_allowed(message.from_user.id):
+        return await message.answer("Нет доступа. Нажми /start и запроси доступ.")
 
     text = message.text
 
@@ -550,6 +587,16 @@ async def menu_anywhere(message: Message, state: FSMContext):
     if text == "📦 Остатки":
         await state.clear()
         return await show_stocks_table(message)
+
+    if text == "⬇️ Скачать БД":
+        await state.clear()
+        return await show_exports_menu(message)
+
+    if text == "👥 Доступ":
+        await state.clear()
+        if not is_admin(message.from_user.id):
+            return await message.answer("Только админ может управлять доступом.")
+        return await access_menu(message)
 
     if text == "💰 Деньги":
         await state.clear()
@@ -644,10 +691,266 @@ async def menu_anywhere(message: Message, state: FSMContext):
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return await message.answer("Нет доступа.")
     await state.clear()
-    await message.answer("Привет! Выбери действие:", reply_markup=main_menu_kb())
+
+    if await is_allowed(message.from_user.id):
+        return await message.answer("Привет! Выбери действие:", reply_markup=main_menu_kb())
+
+    ikb = InlineKeyboardBuilder()
+    ikb.button(text="🔐 Запросить доступ", callback_data="access_req")
+    ikb.adjust(1)
+    await message.answer(
+        "⛔ Доступ ограничен.\nНажми кнопку ниже, чтобы отправить запрос администратору.",
+        reply_markup=ikb.as_markup()
+    )
+
+
+
+# ===================== Access Control =====================
+def access_admin_ids() -> list[int]:
+    ids = set(ADMIN_USER_IDS)
+    if OWNER_ID:
+        ids.add(OWNER_ID)
+    return sorted(ids)
+
+@router.callback_query(F.data == "access_req")
+async def cb_access_req(cq: CallbackQuery):
+    admins = access_admin_ids()
+    if not admins:
+        return await cq.answer("Админы не настроены. Добавь ADMIN_USER_IDS/OWNER_ID.", show_alert=True)
+
+    u = cq.from_user
+    username = f"@{u.username}" if u.username else "-"
+    txt = (
+        "🔐 *Запрос доступа к боту*\n"
+        f"ID: `{u.id}`\n"
+        f"Имя: {safe_text(u.full_name)}\n"
+        f"Username: {username}"
+    )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Разрешить", callback_data=f"access_allow:{u.id}")
+    kb.button(text="❌ Запретить", callback_data=f"access_deny:{u.id}")
+    kb.adjust(2)
+
+    for admin_id in admins:
+        try:
+            await cq.bot.send_message(admin_id, txt, parse_mode=ParseMode.MARKDOWN, reply_markup=kb.as_markup())
+        except Exception:
+            pass
+
+    await cq.message.answer("✅ Запрос отправлен администратору.")
+    await cq.answer()
+
+@router.callback_query(F.data.startswith("access_allow:"))
+async def cb_access_allow(cq: CallbackQuery):
+    if not is_admin(cq.from_user.id):
+        return await cq.answer("Нет прав", show_alert=True)
+    part = (cq.data or "").split(":", 1)[1]
+    if not part.isdigit():
+        return await cq.answer("Ошибка", show_alert=True)
+    uid = int(part)
+
+    async with Session() as s:
+        exists = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == uid))
+        if not exists:
+            s.add(AllowedUser(user_id=uid, added_by=cq.from_user.id, note="approved"))
+            await s.commit()
+
+    try:
+        await cq.bot.send_message(uid, "✅ Доступ выдан. Нажми /start")
+    except Exception:
+        pass
+
+    await cq.answer("Разрешено ✅", show_alert=True)
+
+@router.callback_query(F.data.startswith("access_deny:"))
+async def cb_access_deny(cq: CallbackQuery):
+    if not is_admin(cq.from_user.id):
+        return await cq.answer("Нет прав", show_alert=True)
+    part = (cq.data or "").split(":", 1)[1]
+    if not part.isdigit():
+        return await cq.answer("Ошибка", show_alert=True)
+    uid = int(part)
+
+    async with Session() as s:
+        await s.execute(delete(AllowedUser).where(AllowedUser.user_id == uid))
+        await s.commit()
+
+    try:
+        await cq.bot.send_message(uid, "⛔ Доступ запрещён/снят.")
+    except Exception:
+        pass
+
+    await cq.answer("Снято ✅", show_alert=True)
+
+async def access_menu(message: Message):
+    async with Session() as s:
+        rows = (await s.execute(select(AllowedUser).order_by(AllowedUser.created_at.desc()))).scalars().all()
+
+    lines = ["👥 *Доступ:*",
+             "Команды:",
+             "• `/allow 123456` — выдать доступ по ID",
+             "• `/deny 123456` — снять доступ",
+             "• `/whoami` — узнать свой ID", ""]
+    if rows:
+        lines.append("*Разрешённые пользователи:*")
+        for r in rows[:100]:
+            lines.append(f"• `{r.user_id}`")
+    else:
+        lines.append("Список пуст. Пользователи могут нажимать /start → «Запросить доступ».")
+
+    await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb())
+
+@router.message(Command("whoami"))
+async def cmd_whoami(message: Message):
+    await message.answer(f"Ваш Telegram ID: `{message.from_user.id}`", parse_mode=ParseMode.MARKDOWN)
+
+@router.message(Command("allow"))
+async def cmd_allow(message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.answer("Нет прав.")
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return await message.answer("Использование: /allow 123456")
+    uid = int(parts[1])
+    async with Session() as s:
+        exists = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == uid))
+        if not exists:
+            s.add(AllowedUser(user_id=uid, added_by=message.from_user.id, note="manual"))
+            await s.commit()
+    await message.answer("✅ Выдал доступ.")
+    try:
+        await message.bot.send_message(uid, "✅ Вам выдали доступ. Нажми /start")
+    except Exception:
+        pass
+
+@router.message(Command("deny"))
+async def cmd_deny(message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.answer("Нет прав.")
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return await message.answer("Использование: /deny 123456")
+    uid = int(parts[1])
+    async with Session() as s:
+        await s.execute(delete(AllowedUser).where(AllowedUser.user_id == uid))
+        await s.commit()
+    await message.answer("🗑 Снял доступ.")
+    try:
+        await message.bot.send_message(uid, "⛔ Ваш доступ снят.")
+    except Exception:
+        pass
+
+
+
+# ===================== Exports / DB download =====================
+def exports_menu_kb():
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="📦 Остатки (таблица)")
+    kb.button(text="🟢 Приходы (50)")
+    kb.button(text="🔴 Продажи (50)")
+    kb.adjust(2)
+    kb.button(text="💾 Скачать файл БД")
+    kb.adjust(1)
+    kb.button(text="⬅️ Назад в меню")
+    kb.adjust(1)
+    return kb.as_markup(resize_keyboard=True)
+
+async def show_exports_menu(message: Message):
+    await message.answer("⬇️ Выгрузка данных:", reply_markup=exports_menu_kb())
+
+@router.message(F.text.in_({"📦 Остатки (таблица)", "🟢 Приходы (50)", "🔴 Продажи (50)", "💾 Скачать файл БД"}))
+async def exports_actions(message: Message, state: FSMContext):
+    if not await is_allowed(message.from_user.id):
+        return await message.answer("Нет доступа.")
+
+    if message.text == "📦 Остатки (таблица)":
+        return await show_stocks_table(message)
+
+    if message.text == "🟢 Приходы (50)":
+        return await show_incomes_table(message, limit=50)
+
+    if message.text == "🔴 Продажи (50)":
+        return await show_sales_table(message, limit=50)
+
+    if message.text == "💾 Скачать файл БД":
+        return await send_db_file(message, chat_id=message.chat.id)
+
+async def send_db_file(message: Message, chat_id: int):
+    if "sqlite" not in DB_URL:
+        return await message.bot.send_message(chat_id, "Скачивание файла БД доступно только для SQLite.")
+    db_path = DB_URL.split("////", 1)[-1]
+    if not os.path.exists(db_path):
+        return await message.bot.send_message(chat_id, f"Файл БД не найден: {db_path}")
+
+    try:
+        from aiogram.types import FSInputFile
+        await message.bot.send_document(chat_id, FSInputFile(db_path), caption="💾 Файл базы данных")
+    except Exception as e:
+        await message.bot.send_message(chat_id, f"Не смог отправить файл БД: {e}")
+
+def render_table(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> str:
+    if not rows:
+        return "<pre>(пусто)</pre>"
+
+    cols = list(zip(*([headers] + rows)))
+    widths = [max(len(str(x)) for x in col) for col in cols]
+
+    def fmt_row(row):
+        cells = []
+        for i, val in enumerate(row):
+            s = str(val)
+            if re.fullmatch(r"-?\d+(?:[\.,]\d+)?", s):
+                cells.append(s.rjust(widths[i]))
+            else:
+                cells.append(s.ljust(widths[i]))
+        return " | ".join(cells)
+
+    sep = "-+-".join("-" * w for w in widths)
+    lines = [fmt_row(headers), sep]
+    for r in rows:
+        lines.append(fmt_row(r))
+    return "<pre>" + "\n".join(lines) + "</pre>"
+
+async def show_incomes_table(message: Message, limit: int = 50):
+    async with Session() as s:
+        rows = (await s.execute(
+            select(Income)
+            .options(selectinload(Income.warehouse), selectinload(Income.product))
+            .order_by(Income.id.desc())
+            .limit(limit)
+        )).scalars().all()
+
+    if not rows:
+        return await message.answer("Приходов пока нет.", reply_markup=exports_menu_kb())
+
+    data = [(str(r.doc_date), r.warehouse.name, r.product.name, fmt_kg(r.qty_kg)) for r in rows]
+    headers = ("Дата", "Склад", "Товар", "Кол-во(кг)")
+    await message.answer("🟢 Приходы (последние):\n" + render_table(headers, data),
+                         parse_mode=ParseMode.HTML, reply_markup=exports_menu_kb())
+
+async def show_sales_table(message: Message, limit: int = 50):
+    async with Session() as s:
+        rows = (await s.execute(
+            select(Sale)
+            .options(selectinload(Sale.warehouse), selectinload(Sale.product))
+            .order_by(Sale.id.desc())
+            .limit(limit)
+        )).scalars().all()
+
+    if not rows:
+        return await message.answer("Продаж пока нет.", reply_markup=exports_menu_kb())
+
+    data = []
+    for r in rows:
+        paid = "да" if r.is_paid else "нет"
+        data.append((str(r.doc_date), safe_text(r.customer_name), r.warehouse.name, r.product.name,
+                     fmt_kg(r.qty_kg), fmt_money(r.price_per_kg), fmt_money(r.total_amount), paid))
+
+    headers = ("Дата", "Кому", "Склад", "Товар", "Кг", "Цена/кг", "Сумма", "Опл")
+    await message.answer("🔴 Продажи (последние):\n" + render_table(headers, data),
+                         parse_mode=ParseMode.HTML, reply_markup=exports_menu_kb())
 
 
 # ===================== Warehouses Admin =====================
@@ -2711,6 +3014,44 @@ async def deb_confirm(cq: CallbackQuery, state: FSMContext):
     await cq.answer()
 
 
+
+# ===================== Daily DB backup =====================
+async def backup_loop(bot: Bot):
+    if not AUTO_BACKUP:
+        return
+
+    tz = ZoneInfo(TZ_NAME)
+    hh, mm = 23, 50
+    try:
+        hh, mm = [int(x) for x in BACKUP_TIME_HHMM.split(":", 1)]
+    except Exception:
+        hh, mm = 23, 50
+
+    targets = access_admin_ids()
+    if not targets:
+        return
+
+    while True:
+        now = datetime.now(tz)
+        run_at = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if run_at <= now:
+            run_at = run_at + timedelta(days=1)
+
+        await asyncio.sleep(max(1, int((run_at - now).total_seconds())))
+
+        for chat_id in targets:
+            try:
+                # сделаем "фейковое" message-объект с bot
+                class _M: pass
+                m = _M()
+                m.bot = bot
+                await send_db_file(m, chat_id=chat_id)
+            except Exception:
+                pass
+
+        await asyncio.sleep(1)
+
+
 # ===================== main =====================
 async def main():
     async with engine.begin() as conn:
@@ -2719,6 +3060,8 @@ async def main():
     bot = Bot(TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+
+    asyncio.create_task(backup_loop(bot))
 
     await bot.delete_webhook(drop_pending_updates=True)
     print("=== BOT STARTED OK ===", flush=True)
