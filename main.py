@@ -34,7 +34,7 @@ DB_URL = os.getenv("DB_URL", "sqlite+aiosqlite:////var/data/data.db")
 engine = create_async_engine(DB_URL, echo=False)
 Session = async_sessionmaker(engine, expire_on_commit=False)
 
-OWNER_ID = int(os.getenv("OWNER_ID", "139099579") or 0)
+OWNER_ID = int(os.getenv("OWNER_ID", "139099578") or 0)
 
 print("=== BOOT ===", flush=True)
 print("TOKEN set:", bool(TOKEN), flush=True)
@@ -317,26 +317,37 @@ def main_menu_kb(is_admin_menu: bool = False):
     kb.button(text="💰 Деньги")
     kb.adjust(2)
 
-    kb.button(text="🟢 Приход")
-    kb.button(text="🔴 Продажа")
-    kb.adjust(2)
 
+def reports_menu_kb(is_admin_menu: bool = False):
+    kb = ReplyKeyboardBuilder()
     kb.button(text="📄 Приходы")
     kb.button(text="📄 Продажи")
     kb.adjust(2)
 
     kb.button(text="📥 Выгрузка (таблица)")
-    kb.adjust(1)
-
     kb.button(text="📋 Должники")
+    kb.adjust(2)
+
     kb.button(text="➕ Добавить должн...")
-    kb.adjust(2)
-
     kb.button(text="🏬 Склады")
-    kb.button(text="🧺 Товары")
     kb.adjust(2)
 
+    kb.button(text="🧺 Товары")
     kb.button(text="🏦 Банки")
+    kb.adjust(2)
+
+    if is_admin_menu:
+        kb.button(text="👥 Users")
+        kb.adjust(1)
+
+    kb.button(text="⬅️ Назад")
+    kb.adjust(1)
+    return kb.as_markup(resize_keyboard=True)
+
+    kb.button(text="🟢 Приход")
+    kb.button(text="🔴 Продажа")
+    kb.adjust(2)
+    kb.button(text="📊 Отчеты")
     kb.adjust(1)
 
     if is_admin_menu:
@@ -387,53 +398,6 @@ def yes_no_kb(prefix: str):
     ikb.button(text="❌ Нет", callback_data=f"{prefix}:no")
     ikb.adjust(2)
     return ikb.as_markup()
-
-
-# ---------- INLINE MENUS (2 columns) ----------
-def inline_main_menu_kb(is_admin: bool = False):
-    kb = InlineKeyboardBuilder()
-
-    # Row 1
-    kb.button(text="📦 Остатки", callback_data="main:stocks")
-    kb.button(text="💰 Деньги", callback_data="main:money")
-
-    # Row 2
-    kb.button(text="🟢 Приход", callback_data="main:income")
-    kb.button(text="🔴 Продажа", callback_data="main:sale")
-
-    # Row 3
-    kb.button(text="📊 Отчеты", callback_data="main:reports")
-    if is_admin:
-        kb.button(text="👥 Users", callback_data="main:users")
-    else:
-        kb.button(text="ℹ️ Помощь", callback_data="main:help")
-
-    # Row 4
-    kb.button(text="⚙️ Настройки", callback_data="main:settings")
-    kb.button(text="❌ Закрыть", callback_data="main:close")
-
-    kb.adjust(2)
-    return kb.as_markup()
-
-
-def inline_reports_menu_kb():
-    kb = InlineKeyboardBuilder()
-
-    kb.button(text="📄 Приходы", callback_data="rep:incomes")
-    kb.button(text="📄 Продажи", callback_data="rep:sales")
-
-    kb.button(text="📥 Выгрузка (таблицы)", callback_data="rep:export")
-    kb.button(text="💳 Должники", callback_data="rep:debtors")
-
-    kb.button(text="➕ Добавить должн", callback_data="rep:add_debtor")
-    kb.button(text="🏬 Склады", callback_data="rep:warehouses")
-
-    kb.button(text="🧺 Товары", callback_data="rep:products")
-    kb.button(text="🏦 Банки", callback_data="rep:banks")
-
-    kb.button(text="⬅️ Назад", callback_data="rep:back")
-    kb.adjust(2, 2, 2, 2, 1)
-    return kb.as_markup()
 
 
 def nav_kb(prefix: str, allow_skip: bool):
@@ -600,16 +564,23 @@ router = Router()
 
 MENU_TEXTS = {
     "📦 Остатки", "💰 Деньги", "🟢 Приход", "🔴 Продажа",
-    "📄 Приходы", "📄 Продажи",
-    "📥 Выгрузка (таблица)",
-    "📋 Должники", "➕ Добавить должн...",
-    "🏬 Склады", "🧺 Товары", "🏦 Банки",
     "👥 Users",
     "❌ Отмена",
     "➕ Добавить склад", "📃 Список складов", "🗑 Удалить склад",
     "➕ Добавить товар", "📃 Список товаров", "🗑 Удалить товар",
     "➕ Добавить банк", "📃 Список банков", "🗑 Удалить банк",
     "⬅️ Назад в меню",
+
+    "📊 Отчеты",
+    "⬅️ Назад",
+}
+
+
+REPORTS_TEXTS = {
+    "📄 Приходы", "📄 Продажи", "📥 Выгрузка (таблица)",
+    "📋 Должники", "➕ Добавить должн...",
+    "🏬 Склады", "🧺 Товары", "🏦 Банки",
+    "⬅️ Назад",
 }
 
 
@@ -752,6 +723,14 @@ async def menu_anywhere(message: Message, state: FSMContext):
         await state.clear()
         return await message.answer("Меню:", reply_markup=main_menu_kb(admin_menu))
 
+
+    if text_ == "📊 Отчеты":
+        await state.clear()
+        return await message.answer("Отчеты:", reply_markup=reports_menu_kb(admin_menu))
+
+    if text_ == "⬅️ Назад":
+        await state.clear()
+        return await message.answer("Меню:", reply_markup=main_menu_kb(admin_menu))
     if text_ == "👥 Users":
         if not is_owner(uid):
             return await message.answer("Нет доступа.")
@@ -759,7 +738,7 @@ async def menu_anywhere(message: Message, state: FSMContext):
         page = 0
         txt, users, has_prev, has_next, allowed_ids = await render_users_page(page)
         kb = users_list_kb(page, users, allowed_ids) if users else users_pager_kb(page, has_prev, has_next)
-        return await message.answer(txt, reply_markup=kb)  # markdown disabled to avoid entity parse errors
+        return await message.answer(txt, reply_markup=kb)
 
     if text_ == "📦 Остатки":
         await state.clear()
@@ -863,7 +842,7 @@ async def cmd_start(message: Message, state: FSMContext):
         if not safe_text(u.name):
             await state.set_state(AuthWizard.ask_name)
             return await message.answer("👋 Привет! Введи, пожалуйста, своё имя (как тебя записывать в системе):")
-        return await message.answer("Привет! Выбери действие:", reply_markup=inline_main_menu_kb(is_owner(uid)))
+        return await message.answer("Привет! Выбери действие:", reply_markup=main_menu_kb(is_owner(uid)))
 
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Разрешить", callback_data=f"acc_req:allow:{uid}")
@@ -952,98 +931,9 @@ async def cmd_users(message: Message):
     page = 0
     txt, users, has_prev, has_next, allowed_ids = await render_users_page(page)
     kb = users_list_kb(page, users, allowed_ids) if users else users_pager_kb(page, has_prev, has_next)
-    await message.answer(txt, reply_markup=kb)  # markdown disabled to avoid entity parse errors
+    await message.answer(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
 
-
-
-# ---------- INLINE MAIN MENU HANDLERS ----------
-@router.callback_query(F.data.startswith("main:"))
-async def cb_inline_main_menu(cq: CallbackQuery, state: FSMContext):
-    uid = cq.from_user.id
-    await upsert_user_from_tg(cq.from_user)
-
-    if not (await is_allowed(uid)):
-        return await cq.answer("Нет доступа. Напишите /start для запроса доступа.", show_alert=True)
-
-    is_admin = is_owner(uid)
-    action = (cq.data or "").split(":", 1)[1]
-
-    if action == "close":
-        try:
-            await cq.message.delete()
-        except Exception:
-            pass
-        return await cq.answer("Ок")
-
-    if action == "reports":
-        await state.clear()
-        await cq.message.edit_text("📊 Отчеты: выбери раздел", reply_markup=inline_reports_menu_kb())
-        return await cq.answer()
-
-    if action == "users":
-        if not is_admin:
-            return await cq.answer("Нет доступа", show_alert=True)
-        # reuse existing /users rendering but send WITHOUT markdown to avoid entity parse crash
-        page = 0
-        txt, users, has_prev, has_next, allowed_ids = await render_users_page(page)
-        kb = users_list_kb(page, users, allowed_ids) if users else users_pager_kb(page, has_prev, has_next)
-        await cq.message.edit_text(txt, reply_markup=kb)  # no parse_mode here
-        return await cq.answer()
-
-    # For now, route user to existing text-menu handlers by sending instructions
-    # (keeps your existing business logic intact).
-    mapping = {
-        "stocks": "📦 Остатки",
-        "money": "💰 Деньги",
-        "income": "🟢 Приход",
-        "sale": "🔴 Продажа",
-        "settings": "⚙️ Настройки",
-        "help": "ℹ️ Помощь",
-    }
-    if action in mapping:
-        # emulate a text command by answering with hint and keep replykeyboard compatibility
-        try:
-            await cq.message.answer(mapping[action], reply_markup=main_menu_kb(is_admin))
-        except Exception:
-            pass
-        return await cq.answer()
-
-
-# ---------- INLINE REPORTS MENU HANDLERS ----------
-@router.callback_query(F.data.startswith("rep:"))
-async def cb_inline_reports_menu(cq: CallbackQuery, state: FSMContext):
-    uid = cq.from_user.id
-    await upsert_user_from_tg(cq.from_user)
-
-    if not (await is_allowed(uid)):
-        return await cq.answer("Нет доступа", show_alert=True)
-
-    is_admin = is_owner(uid)
-    action = (cq.data or "").split(":", 1)[1]
-
-    if action == "back":
-        await state.clear()
-        await cq.message.edit_text("Выбери действие:", reply_markup=inline_main_menu_kb(is_admin))
-        return await cq.answer()
-
-    mapping = {
-        "incomes": "📄 Приходы",
-        "sales": "📄 Продажи",
-        "export": "📥 Выгрузка (таблицы)",
-        "debtors": "💳 Должники",
-        "add_debtor": "➕ Добавить должн",
-        "warehouses": "🏬 Склады",
-        "products": "🧺 Товары",
-        "banks": "🏦 Банки",
-    }
-    if action in mapping:
-        # call existing logic via message flow (send the same text)
-        try:
-            await cq.message.answer(mapping[action], reply_markup=main_menu_kb(is_admin))
-        except Exception:
-            pass
-        return await cq.answer()
 @router.message(Command("allow"))
 async def cmd_allow(message: Message):
     if not is_owner(message.from_user.id):
@@ -3268,3 +3158,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
