@@ -67,6 +67,44 @@ class Product(Base):
     name: Mapped[str] = mapped_column(String(150), unique=True, index=True)
 
 
+
+class StockMovement(Base):
+    __tablename__ = "stock_movements"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    entry_date: Mapped[date] = mapped_column(Date, index=True)
+
+    warehouse_id: Mapped[int] = mapped_column(ForeignKey("warehouses.id"), index=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
+    qty_kg: Mapped[Decimal] = mapped_column(Numeric(18, 3))  # +income, -sale
+
+    doc_type: Mapped[str] = mapped_column(String(20), index=True)  # "sale"/"income"/"adjust"
+    doc_id: Mapped[int] = mapped_column(Integer, index=True)
+
+    warehouse: Mapped[Warehouse] = relationship()
+    product: Mapped[Product] = relationship()
+
+
+class MoneyMovement(Base):
+    __tablename__ = "money_movements"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    entry_date: Mapped[date] = mapped_column(Date, index=True)
+
+    direction: Mapped[str] = mapped_column(String(10))  # in/out (informational)
+    method: Mapped[str] = mapped_column(String(10), default="")
+
+    account_type: Mapped[str] = mapped_column(String(10), default="cash")  # cash/bank/ip
+    bank_id: Mapped[int | None] = mapped_column(ForeignKey("banks.id"), nullable=True)
+    bank: Mapped["Bank | None"] = relationship()
+
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2))  # +in, -out
+
+    doc_type: Mapped[str] = mapped_column(String(20), index=True)  # "sale"/"income"/"adjust"
+    doc_id: Mapped[int] = mapped_column(Integer, index=True)
+
+    note: Mapped[str] = mapped_column(String(300), default="")
+
 class Bank(Base):
     __tablename__ = "banks"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -749,6 +787,44 @@ async def get_stock_row(session, warehouse_id: int, product_id: int) -> Stock:
     )
     if row:
         return row
+
+
+
+async def recalc_stocks(session):
+    # Recompute `stocks` table from `stock_movements` (cache/live view).
+    await session.execute(delete(Stock))
+    await session.flush()
+
+    rows = (await session.execute(
+        select(StockMovement.warehouse_id, StockMovement.product_id, func.coalesce(func.sum(StockMovement.qty_kg), 0))
+        .group_by(StockMovement.warehouse_id, StockMovement.product_id)
+    )).all()
+
+    for wid, pid, qty in rows:
+        q = Decimal(qty or 0)
+        session.add(Stock(warehouse_id=wid, product_id=pid, qty_kg=q))
+    await session.flush()
+
+
+async def recalc_money_ledger(session):
+    # Recompute `money_ledger` from `money_movements` (keeps existing UI compatible).
+    await session.execute(delete(MoneyLedger))
+    await session.flush()
+
+    mvs = (await session.execute(select(MoneyMovement).order_by(MoneyMovement.id))).scalars().all()
+    for mv in mvs:
+        amt = Decimal(mv.amount or 0)
+        direction = "in" if amt >= 0 else "out"
+        session.add(MoneyLedger(
+            entry_date=mv.entry_date,
+            direction=direction,
+            method=mv.method or ("cash" if mv.account_type == "cash" else "noncash"),
+            account_type=mv.account_type,
+            bank_id=mv.bank_id,
+            amount=abs(amt),
+            note=mv.note or f"{mv.doc_type}#{mv.doc_id}"
+        ))
+    await session.flush()
     row = Stock(warehouse_id=warehouse_id, product_id=product_id, qty_kg=Decimal("0"))
     session.add(row)
     await session.flush()
@@ -806,18 +882,25 @@ async def pick_bank_kb(prefix: str):
     return ikb.as_markup()
 
 
+
 async def show_stocks_table(message: Message, state: FSMContext):
     async with Session() as s:
         rows = (await s.execute(
-            select(Stock)
-            .options(selectinload(Stock.warehouse), selectinload(Stock.product))
-            .order_by(Stock.warehouse_id, Stock.product_id)
-        )).scalars().all()
+            select(
+                Warehouse.name,
+                Product.name,
+                func.coalesce(func.sum(StockMovement.qty_kg), 0).label("qty")
+            )
+            .join(Warehouse, Warehouse.id == StockMovement.warehouse_id)
+            .join(Product, Product.id == StockMovement.product_id)
+            .group_by(Warehouse.name, Product.name)
+            .order_by(Warehouse.name, Product.name)
+        )).all()
 
     if not rows:
         return await reply_in_menu(message, state, "Остатков пока нет.")
 
-    data = [(r.warehouse.name, r.product.name, fmt_kg(r.qty_kg)) for r in rows if Decimal(r.qty_kg) != 0]
+    data = [(wh, pr, fmt_kg(Decimal(qty))) for (wh, pr, qty) in rows if Decimal(qty) != 0]
     if not data:
         return await reply_in_menu(message, state, "Пока везде 0.")
 
@@ -827,32 +910,25 @@ async def show_stocks_table(message: Message, state: FSMContext):
 
     lines = []
     lines.append(f"{'Склад'.ljust(w1)} | {'Товар'.ljust(w2)} | {'Остаток(кг)'.rjust(w3)}")
-    lines.append(f"{'-'*w1}-+-{'-'*w2}-+-{'-'*w3}")
+    lines.append(f"{'-' * w1}-+-{'-' * w2}-+-{'-' * w3}")
     for wh, pr, q in data:
         lines.append(f"{wh.ljust(w1)} | {pr.ljust(w2)} | {q.rjust(w3)}")
 
-    txt = "📦 Остатки:\n<pre>" + "\n".join(lines) + "</pre>"
+    txt = "📦 <b>Остатки</b>:\n<pre>" + "\n".join(lines) + "</pre>"
     await message.answer(txt, parse_mode=ParseMode.HTML)
     await reply_in_menu(message, state, "Готово ✅")
+
 
 
 async def show_money(message: Message, state: FSMContext):
     async with Session() as s:
         rows = (await s.execute(
             select(
-                MoneyLedger.account_type,
-                MoneyLedger.bank_id,
-                func.coalesce(
-                    func.sum(
-                        case(
-                            (MoneyLedger.direction == "in", MoneyLedger.amount),
-                            else_=-MoneyLedger.amount
-                        )
-                    ),
-                    0
-                ).label("bal")
+                MoneyMovement.account_type,
+                MoneyMovement.bank_id,
+                func.coalesce(func.sum(MoneyMovement.amount), 0).label("bal")
             )
-            .group_by(MoneyLedger.account_type, MoneyLedger.bank_id)
+            .group_by(MoneyMovement.account_type, MoneyMovement.bank_id)
         )).all()
 
         bank_ids = [r.bank_id for r in rows if r.bank_id is not None]
@@ -879,24 +955,26 @@ async def show_money(message: Message, state: FSMContext):
     bank_lines.sort(key=lambda x: x[0].lower())
     ip_lines.sort(key=lambda x: x[0].lower())
 
-    txt = ["💰 <b>Деньги (балансы):</b>",
-           f"\n💵 <b>Наличные:</b> <b>{fmt_money(cash_balance)}</b>"]
+    lines = [
+        "💰 <b>Деньги (балансы)</b>",
+        f"\n💵 <b>Наличные:</b> <b>{h(fmt_money(cash_balance))}</b>",
+        "\n🏦 <b>Банки:</b>",
+    ]
 
-    txt.append("\n🏦 <b>Банки:</b>")
     if bank_lines:
         for name, bal in bank_lines:
-            txt.append(f"• {h(name)}: <b>{fmt_money(bal)}</b>")
+            lines.append(f"• {h(name)}: <b>{h(fmt_money(bal))}</b>")
     else:
-        txt.append("• (пусто)")
+        lines.append("• (пусто)")
 
-    txt.append("\n👤 <b>Счёт ИП:</b>")
+    lines.append("\n👤 <b>Счёт ИП:</b>")
     if ip_lines:
         for name, bal in ip_lines:
-            txt.append(f"• {h(name)}: <b>{fmt_money(bal)}</b>")
+            lines.append(f"• {h(name)}: <b>{h(fmt_money(bal))}</b>")
     else:
-        txt.append("• (пусто)")
+        lines.append("• (пусто)")
 
-    await message.answer("\n".join(txt), parse_mode=ParseMode.HTML)
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
     await reply_in_menu(message, state, "Готово ✅")
 
 
@@ -1161,59 +1239,31 @@ async def cb_sale_paid_id(cq: CallbackQuery):
     await cq.answer()
 
 
+
 @router.callback_query(F.data.startswith("sale_del:"))
 async def cb_sale_del(cq: CallbackQuery):
     part = cq.data.split(":", 1)[1] if cq.data else ""
     if not part.isdigit():
         return await cq.answer("Ошибка кнопки", show_alert=True)
     sale_id = int(part)
+
     async with Session() as s:
-        sale = await s.get(Sale, sale_id)
-        if not sale:
-            return await cq.answer("Не найдено", show_alert=True)
+        async with s.begin():
+            sale = await s.get(Sale, sale_id)
+            if not sale:
+                return await cq.answer("Не найдено", show_alert=True)
 
-        await s.execute(delete(Sale).where(Sale.id == sale_id))
-        await s.commit()
+            await s.execute(delete(StockMovement).where(StockMovement.doc_type == "sale", StockMovement.doc_id == sale_id))
+            await s.execute(delete(MoneyMovement).where(MoneyMovement.doc_type == "sale", MoneyMovement.doc_id == sale_id))
+            await s.execute(delete(Sale).where(Sale.id == sale_id))
 
-    await cq.message.answer(f"🗑 Продажа #{sale_id} удалена.")
+            await recalc_stocks(s)
+            await recalc_money_ledger(s)
+
+    await cq.message.answer(f"🗑 Продажа <b>#{sale_id}</b> удалена (с откатом движений).", parse_mode=ParseMode.HTML)
     await cq.answer()
 
 
-async def list_sales(message: Message, state: FSMContext):
-    async with Session() as s:
-        rows = (await s.execute(
-            select(Sale)
-            .options(selectinload(Sale.warehouse), selectinload(Sale.product), selectinload(Sale.bank))
-            .order_by(Sale.id.desc())
-            .limit(50)
-        )).scalars().all()
-
-    if not rows:
-        return await reply_in_menu(message, state, "Продаж пока нет.")
-
-    table_rows = []
-    for r in rows:
-        paid = "OK" if r.is_paid else "DEBT"
-        who = safe_text(r.customer_name) or "-"
-        wh = r.warehouse.name if r.warehouse else "-"
-        pr = r.product.name if r.product else "-"
-        qty = fmt_kg(Decimal(r.qty_kg or 0))
-        price = fmt_money(Decimal(r.price_per_kg or 0))
-        total = fmt_money(Decimal(r.total_amount or 0))
-        table_rows.append([f"#{r.id}", str(r.doc_date), who, wh, pr, qty, price, total, paid])
-
-    txt = "📄 <b>Продажи (последние 50)</b>\n" + render_pre_table(
-        headers=["ID", "Дата", "Клиент", "Склад", "Товар", "кг", "цена", "сумма", "стат"],
-        rows=table_rows
-    )
-    await message.answer(txt, parse_mode=ParseMode.HTML)
-
-    await reply_in_menu(
-        message,
-        state,
-        "Чтобы управлять записью: напиши <code>продажа #ID</code> (например <code>продажа #12</code>)",
-        parse_mode=ParseMode.HTML
-    )
 
 @router.message(F.text.regexp(r"(?i)^продажа\s+#\d+$"))
 async def sale_by_id(message: Message, state: FSMContext):
@@ -1255,57 +1305,31 @@ def income_actions_kb(income_id: int):
     return ikb.as_markup()
 
 
+
 @router.callback_query(F.data.startswith("inc_del:"))
 async def cb_inc_del(cq: CallbackQuery):
     part = cq.data.split(":", 1)[1] if cq.data else ""
     if not part.isdigit():
         return await cq.answer("Ошибка кнопки", show_alert=True)
     income_id = int(part)
+
     async with Session() as s:
-        inc = await s.get(Income, income_id)
-        if not inc:
-            return await cq.answer("Не найдено", show_alert=True)
-        await s.execute(delete(Income).where(Income.id == income_id))
-        await s.commit()
-    await cq.message.answer(f"🗑 Приход #{income_id} удалён.")
+        async with s.begin():
+            inc = await s.get(Income, income_id)
+            if not inc:
+                return await cq.answer("Не найдено", show_alert=True)
+
+            await s.execute(delete(StockMovement).where(StockMovement.doc_type == "income", StockMovement.doc_id == income_id))
+            await s.execute(delete(MoneyMovement).where(MoneyMovement.doc_type == "income", MoneyMovement.doc_id == income_id))
+            await s.execute(delete(Income).where(Income.id == income_id))
+
+            await recalc_stocks(s)
+            await recalc_money_ledger(s)
+
+    await cq.message.answer(f"🗑 Приход <b>#{income_id}</b> удалён (с откатом движений).", parse_mode=ParseMode.HTML)
     await cq.answer()
 
 
-async def list_incomes(message: Message, state: FSMContext):
-    async with Session() as s:
-        rows = (await s.execute(
-            select(Income)
-            .options(selectinload(Income.warehouse), selectinload(Income.product), selectinload(Income.bank))
-            .order_by(Income.id.desc())
-            .limit(50)
-        )).scalars().all()
-
-    if not rows:
-        return await reply_in_menu(message, state, "Приходов пока нет.")
-
-    table_rows = []
-    for r in rows:
-        who = safe_text(r.supplier_name) or "-"
-        wh = r.warehouse.name if r.warehouse else "-"
-        pr = r.product.name if r.product else "-"
-        qty = fmt_kg(Decimal(r.qty_kg or 0))
-        price = fmt_money(Decimal(r.price_per_kg or 0))
-        total = fmt_money(Decimal(r.total_amount or 0))
-        money = "OUT" if r.add_money_entry else "-"
-        table_rows.append([f"#{r.id}", str(r.doc_date), who, wh, pr, qty, price, total, money])
-
-    txt = "📄 <b>Приходы (последние 50)</b>\n" + render_pre_table(
-        headers=["ID", "Дата", "Поставщик", "Склад", "Товар", "кг", "цена", "сумма", "деньги"],
-        rows=table_rows
-    )
-    await message.answer(txt, parse_mode=ParseMode.HTML)
-
-    await reply_in_menu(
-        message,
-        state,
-        "Чтобы посмотреть/удалить: напиши <code>приход #ID</code> (например <code>приход #7</code>)",
-        parse_mode=ParseMode.HTML
-    )
 
 @router.message(F.text.regexp(r"(?i)^приход\s+#\d+$"))
 async def inc_by_id(message: Message, state: FSMContext):
@@ -2413,7 +2437,7 @@ async def sale_confirm(cq: CallbackQuery, state: FSMContext):
     total = qty * price
     delivery = Decimal(data.get("delivery", "0"))
 
-    is_paid = bool(data.get("is_paid"))
+    is_paid_ = bool(data.get("is_paid"))
     payment_method = data.get("payment_method", "")
 
     account_type = data.get("account_type", "cash")
@@ -2431,181 +2455,97 @@ async def sale_confirm(cq: CallbackQuery, state: FSMContext):
         bank_id = int(bank_id)
 
     async with Session() as s:
-        w = await s.get(Warehouse, warehouse_id)
-        p = await s.get(Product, product_id)
-        if not w or not p:
-            await state.clear()
-            await set_menu(state, "main")
-            await cq.message.answer("Ошибка: склад/товар не найден. Проверь справочники.", reply_markup=main_menu_kb(is_owner(cq.from_user.id)))
-            return await cq.answer()
+        async with s.begin():
+            w = await s.get(Warehouse, warehouse_id)
+            p = await s.get(Product, product_id)
+            if not w or not p:
+                raise RuntimeError("warehouse/product not found")
 
-        if account_type in ("bank", "ip"):
-            b = await s.get(Bank, bank_id)
-            if not b:
-                await cq.answer("Банк не найден", show_alert=True)
-                return
+            if account_type in ("bank", "ip"):
+                b = await s.get(Bank, bank_id)
+                if not b:
+                    await cq.answer("Банк не найден", show_alert=True)
+                    return
 
-        await get_stock_row(s, w.id, p.id)
-
-        res = await s.execute(
-            update(Stock)
-            .where(
-                Stock.warehouse_id == w.id,
-                Stock.product_id == p.id,
-                Stock.qty_kg >= qty
-            )
-            .values(qty_kg=Stock.qty_kg - qty)
-        )
-
-        if res.rowcount == 0:
+            # Check available stock from movements
             cur_qty = await s.scalar(
-                select(Stock.qty_kg).where(
-                    Stock.warehouse_id == w.id,
-                    Stock.product_id == p.id
-                )
+                select(func.coalesce(func.sum(StockMovement.qty_kg), 0))
+                .where(StockMovement.warehouse_id == w.id, StockMovement.product_id == p.id)
             )
             cur_qty = Decimal(cur_qty or 0)
+            if cur_qty < qty:
+                await state.clear()
+                await set_menu(state, "main")
+                await cq.message.answer(
+                    f"❗ Недостаточно товара.\nЕсть: {h(fmt_kg(cur_qty))} кг, нужно: {h(fmt_kg(qty))} кг",
+                    reply_markup=main_menu_kb(is_owner(cq.from_user.id)),
+                    parse_mode=ParseMode.HTML
+                )
+                return await cq.answer()
 
-            await state.clear()
-            await set_menu(state, "main")
-            await cq.message.answer(
-                f"❗ Недостаточно товара.\nЕсть: {fmt_kg(cur_qty)} кг, нужно: {fmt_kg(qty)} кг",
-                reply_markup=main_menu_kb(is_owner(cq.from_user.id))
-            )
-            return await cq.answer()
-
-        sale = Sale(
-            doc_date=doc_date,
-            customer_name=customer_name,
-            customer_phone=customer_phone,
-            warehouse_id=w.id,
-            product_id=p.id,
-            qty_kg=qty,
-            price_per_kg=price,
-            total_amount=total,
-            delivery_cost=delivery,
-            is_paid=is_paid,
-            payment_method=payment_method if is_paid else "",
-            account_type=account_type if is_paid else "cash",
-            bank_id=bank_id if (is_paid and account_type in ("bank", "ip")) else None
-        )
-        s.add(sale)
-        await s.flush()
-
-        if is_paid:
-            s.add(MoneyLedger(
-                entry_date=doc_date,
-                direction="in",
-                method=payment_method or "cash",
-                account_type=account_type,
-                bank_id=bank_id if account_type in ("bank", "ip") else None,
-                amount=total,
-                note=f"Продажа #{sale.id} ({customer_name})"
-            ))
-        else:
-            s.add(Debtor(
+            sale = Sale(
                 doc_date=doc_date,
                 customer_name=customer_name,
                 customer_phone=customer_phone,
-                warehouse_name=w.name,
-                product_name=p.name,
+                warehouse_id=w.id,
+                product_id=p.id,
                 qty_kg=qty,
                 price_per_kg=price,
                 total_amount=total,
                 delivery_cost=delivery,
-                is_paid=False
+                is_paid=is_paid_,
+                payment_method=payment_method if is_paid_ else "",
+                account_type=account_type if is_paid_ else "cash",
+                bank_id=bank_id if (is_paid_ and account_type in ("bank", "ip")) else None
+            )
+            s.add(sale)
+            await s.flush()
+
+            # Stock movement for sale (negative)
+            s.add(StockMovement(
+                entry_date=doc_date,
+                warehouse_id=w.id,
+                product_id=p.id,
+                qty_kg=-qty,
+                doc_type="sale",
+                doc_id=sale.id
             ))
 
-        await s.commit()
+            if is_paid_:
+                # Money movement +amount
+                s.add(MoneyMovement(
+                    entry_date=doc_date,
+                    direction="in",
+                    method=payment_method or "cash",
+                    account_type=account_type,
+                    bank_id=bank_id if account_type in ("bank", "ip") else None,
+                    amount=total,
+                    doc_type="sale",
+                    doc_id=sale.id,
+                    note=f"Продажа #{sale.id} ({customer_name})"
+                ))
+            else:
+                s.add(Debtor(
+                    doc_date=doc_date,
+                    customer_name=customer_name,
+                    customer_phone=customer_phone,
+                    warehouse_name=w.name,
+                    product_name=p.name,
+                    qty_kg=qty,
+                    price_per_kg=price,
+                    total_amount=total,
+                    delivery_cost=delivery,
+                    is_paid=False
+                ))
+
+            # Keep existing UI caches consistent
+            await recalc_stocks(s)
+            await recalc_money_ledger(s)
 
     await state.clear()
     await set_menu(state, "main")
     await cq.message.answer("✅ Продажа сохранена.", reply_markup=main_menu_kb(is_owner(cq.from_user.id)))
     await cq.answer()
-
-
-INCOME_FLOW = [
-    "doc_date", "supplier_name", "supplier_phone", "warehouse_id", "product_id",
-    "qty", "price", "delivery", "add_money", "pay_method", "account_type", "bank_pick", "confirm"
-]
-
-
-def income_state_name(state: State) -> str:
-    return str(state).split(":")[-1]
-
-
-async def income_go_to(state: FSMContext, step: str):
-    mapping = {
-        "doc_date": IncomeWizard.doc_date,
-        "supplier_name": IncomeWizard.supplier_name,
-        "supplier_phone": IncomeWizard.supplier_phone,
-        "warehouse_id": IncomeWizard.warehouse,
-        "product_id": IncomeWizard.product,
-        "qty": IncomeWizard.qty,
-        "price": IncomeWizard.price,
-        "delivery": IncomeWizard.delivery,
-        "add_money": IncomeWizard.add_money,
-        "pay_method": IncomeWizard.pay_method,
-        "account_type": IncomeWizard.account_type,
-        "bank_pick": IncomeWizard.bank_pick,
-        "confirm": IncomeWizard.confirm,
-    }
-    await state.set_state(mapping[step])
-
-
-async def income_prompt(message: Message, state: FSMContext):
-    cur = await state.get_state()
-    step = income_state_name(cur)
-
-    if step == "doc_date":
-        await message.answer("Дата прихода:", reply_markup=choose_date_kb("inc"))
-        return
-    if step == "supplier_name":
-        await message.answer("Имя поставщика:", reply_markup=nav_kb("inc_nav:supplier_name", allow_skip=True))
-        return
-    if step == "supplier_phone":
-        await message.answer("Телефон поставщика:", reply_markup=nav_kb("inc_nav:supplier_phone", allow_skip=True))
-        return
-    if step == "warehouse":
-        await message.answer("Выбери склад прихода:", reply_markup=await pick_warehouse_kb("inc_wh"))
-        return
-    if step == "product":
-        await message.answer("Выбери товар:", reply_markup=await pick_product_kb("inc_pr"))
-        return
-    if step == "qty":
-        await message.answer("Кол-во (кг):", reply_markup=nav_kb("inc_nav:qty", allow_skip=False))
-        return
-    if step == "price":
-        await message.answer("Цена за 1 кг:", reply_markup=nav_kb("inc_nav:price", allow_skip=False))
-        return
-    if step == "delivery":
-        await message.answer("Доставка (0 если нет):", reply_markup=nav_kb("inc_nav:delivery", allow_skip=True))
-        return
-    if step == "add_money":
-        await message.answer("Добавить запись денег (расход) по этому приходу?", reply_markup=yes_no_kb("inc_money"))
-        return
-    if step == "pay_method":
-        await message.answer("Как оплатили поставщику?", reply_markup=pay_method_kb("inc_pay"))
-        return
-    if step == "account_type":
-        await message.answer("С какого счёта ушли деньги?", reply_markup=account_type_kb("inc_acc"))
-        return
-    if step == "bank_pick":
-        await message.answer("Выбери банк/счёт из списка:", reply_markup=await pick_bank_kb("inc_bank"))
-        return
-    if step == "confirm":
-        data = await state.get_data()
-        await message.answer(build_income_summary(data) + "\n\nПодтвердить?",
-                             parse_mode=ParseMode.HTML,
-                             reply_markup=yes_no_kb("inc_confirm"))
-        return
-
-
-async def start_income(message: Message, state: FSMContext, is_admin: bool):
-    await state.clear()
-    await set_menu(state, "main")
-    await income_go_to(state, "doc_date")
-    await income_prompt(message, state)
 
 
 @router.callback_query(F.data.startswith("cal:inc:"))
@@ -2989,65 +2929,66 @@ async def inc_confirm(cq: CallbackQuery, state: FSMContext):
         bank_id = int(bank_id)
 
     async with Session() as s:
-        w = await s.get(Warehouse, warehouse_id)
-        p = await s.get(Product, product_id)
-        if not w or not p:
-            await state.clear()
-            await set_menu(state, "main")
-            await cq.message.answer("Ошибка: склад/товар не найден. Проверь справочники.", reply_markup=main_menu_kb(is_owner(cq.from_user.id)))
-            return await cq.answer()
+        async with s.begin():
+            w = await s.get(Warehouse, warehouse_id)
+            p = await s.get(Product, product_id)
+            if not w or not p:
+                raise RuntimeError("warehouse/product not found")
 
-        if account_type in ("bank", "ip"):
-            b = await s.get(Bank, bank_id)
-            if not b:
-                await cq.answer("Банк не найден", show_alert=True)
-                return
+            if account_type in ("bank", "ip"):
+                b = await s.get(Bank, bank_id)
+                if not b:
+                    await cq.answer("Банк не найден", show_alert=True)
+                    return
 
-        stock = await get_stock_row(s, w.id, p.id)
-        stock.qty_kg = Decimal(stock.qty_kg) + qty
+            inc = Income(
+                doc_date=doc_date,
+                supplier_name=supplier_name,
+                supplier_phone=supplier_phone,
+                warehouse_id=w.id,
+                product_id=p.id,
+                qty_kg=qty,
+                price_per_kg=price,
+                total_amount=total,
+                delivery_cost=delivery,
+                add_money_entry=add_money_entry,
+                payment_method=payment_method if add_money_entry else "",
+                account_type=account_type if add_money_entry else "cash",
+                bank_id=bank_id if (add_money_entry and account_type in ("bank", "ip")) else None
+            )
+            s.add(inc)
+            await s.flush()
 
-        inc = Income(
-            doc_date=doc_date,
-            supplier_name=supplier_name,
-            supplier_phone=supplier_phone,
-            warehouse_id=w.id,
-            product_id=p.id,
-            qty_kg=qty,
-            price_per_kg=price,
-            total_amount=total,
-            delivery_cost=delivery,
-            add_money_entry=add_money_entry,
-            payment_method=payment_method if add_money_entry else "",
-            account_type=account_type if add_money_entry else "cash",
-            bank_id=bank_id if (add_money_entry and account_type in ("bank", "ip")) else None
-        )
-        s.add(inc)
-        await s.flush()
-
-        if add_money_entry:
-            s.add(MoneyLedger(
+            # Stock movement for income (positive)
+            s.add(StockMovement(
                 entry_date=doc_date,
-                direction="out",
-                method=payment_method or "cash",
-                account_type=account_type,
-                bank_id=bank_id if account_type in ("bank", "ip") else None,
-                amount=total,
-                note=f"Приход #{inc.id} (поставщик {supplier_name})"
+                warehouse_id=w.id,
+                product_id=p.id,
+                qty_kg=qty,
+                doc_type="income",
+                doc_id=inc.id
             ))
 
-        await s.commit()
+            if add_money_entry:
+                s.add(MoneyMovement(
+                    entry_date=doc_date,
+                    direction="out",
+                    method=payment_method or "cash",
+                    account_type=account_type,
+                    bank_id=bank_id if account_type in ("bank", "ip") else None,
+                    amount=-total,
+                    doc_type="income",
+                    doc_id=inc.id,
+                    note=f"Приход #{inc.id} (поставщик {supplier_name})"
+                ))
+
+            await recalc_stocks(s)
+            await recalc_money_ledger(s)
 
     await state.clear()
     await set_menu(state, "main")
     await cq.message.answer("✅ Приход сохранён.", reply_markup=main_menu_kb(is_owner(cq.from_user.id)))
     await cq.answer()
-
-
-async def start_debtor(message: Message, state: FSMContext):
-    await state.clear()
-    await set_menu(state, "reports")
-    await state.set_state(DebtorWizard.doc_date)
-    await message.answer("Дата (для должника):", reply_markup=choose_date_kb("deb"))
 
 
 @router.callback_query(F.data.startswith("cal:deb:"))
@@ -3266,6 +3207,38 @@ async def main():
         await ensure_allowed_users_schema(conn)
         await ensure_users_schema(conn)
 
+
+    # One-time migration: if there are sales/incomes but no movements, generate movements from existing docs.
+    async with Session() as s:
+        async with s.begin():
+            sm_cnt = int(await s.scalar(select(func.count()).select_from(StockMovement)) or 0)
+            mm_cnt = int(await s.scalar(select(func.count()).select_from(MoneyMovement)) or 0)
+            if sm_cnt == 0 and mm_cnt == 0:
+                sales = (await s.execute(select(Sale))).scalars().all()
+                incomes = (await s.execute(select(Income))).scalars().all()
+
+                for sale in sales:
+                    s.add(StockMovement(entry_date=sale.doc_date, warehouse_id=sale.warehouse_id, product_id=sale.product_id,
+                                        qty_kg=-Decimal(sale.qty_kg), doc_type="sale", doc_id=sale.id))
+                    if sale.is_paid:
+                        s.add(MoneyMovement(entry_date=sale.doc_date, direction="in", method=sale.payment_method or "cash",
+                                            account_type=sale.account_type or "cash",
+                                            bank_id=sale.bank_id if (sale.account_type in ("bank","ip")) else None,
+                                            amount=Decimal(sale.total_amount), doc_type="sale", doc_id=sale.id,
+                                            note=f"Продажа #{sale.id} ({sale.customer_name})"))
+                for inc in incomes:
+                    s.add(StockMovement(entry_date=inc.doc_date, warehouse_id=inc.warehouse_id, product_id=inc.product_id,
+                                        qty_kg=Decimal(inc.qty_kg), doc_type="income", doc_id=inc.id))
+                    if inc.add_money_entry:
+                        s.add(MoneyMovement(entry_date=inc.doc_date, direction="out", method=inc.payment_method or "cash",
+                                            account_type=inc.account_type or "cash",
+                                            bank_id=inc.bank_id if (inc.account_type in ("bank","ip")) else None,
+                                            amount=-Decimal(inc.total_amount), doc_type="income", doc_id=inc.id,
+                                            note=f"Приход #{inc.id} (поставщик {inc.supplier_name})"))
+                await recalc_stocks(s)
+                await recalc_money_ledger(s)
+
+
     async with Session() as s:
         ex = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == OWNER_ID))
         if not ex:
@@ -3283,6 +3256,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
