@@ -266,6 +266,19 @@ def fmt_kg(x: Decimal) -> str:
     return f"{Decimal(x):.3f}".rstrip("0").rstrip(".")
 
 
+def render_pre_table(headers: list[str], rows: list[list[str]]) -> str:
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(cell))
+
+    line1 = " | ".join(headers[i].ljust(widths[i]) for i in range(len(headers)))
+    line2 = "-+-".join("-" * widths[i] for i in range(len(headers)))
+    body = []
+    for r in rows:
+        body.append(" | ".join(r[i].ljust(widths[i]) for i in range(len(headers))))
+    return "<pre>" + "\n".join([line1, line2] + body) + "</pre>"
+
 def safe_text(s: str) -> str:
     return (s or "").strip()
 
@@ -670,37 +683,34 @@ def user_manage_kb(uid: int, allowed: bool, back_page: int):
 async def render_users_page(page: int) -> tuple[str, list[User], set[int], bool, bool, int, int]:
     async with Session() as s:
         total = int(await s.scalar(select(func.count()).select_from(User)) or 0)
-        if total == 0:
-            return "👥 Users: пусто.", [], set(), False, False, 0, 0
+        if total <= 0:
+            return "👥 <b>Users</b>: пусто.", [], set(), False, False, 0, 0
 
         page = max(int(page), 0)
-        max_page = max((total - 1) // USERS_PAGE_SIZE, 0)
+        max_page = max(0, (total - 1) // USERS_PAGE_SIZE)
         real_page = min(page, max_page)
 
         users = (await s.execute(
-            select(User).order_by(User.created_at.desc()).offset(real_page * USERS_PAGE_SIZE).limit(USERS_PAGE_SIZE)
+            select(User)
+            .order_by(User.created_at.desc())
+            .offset(real_page * USERS_PAGE_SIZE)
+            .limit(USERS_PAGE_SIZE)
         )).scalars().all()
 
         allowed_ids = set((await s.execute(select(AllowedUser.user_id))).scalars().all())
 
     has_prev = real_page > 0
-    has_next = (real_page + 1) * USERS_PAGE_SIZE < total
+    has_next = real_page < max_page
 
-    lines = [f"👥 <b>Users</b> (всего: <b>{total}</b>), стр <b>{real_page+1}</b> из <b>{max_page+1}</b>:
-"]
+    lines = [f"👥 <b>Users</b> (всего: <b>{total}</b>), стр <b>{real_page+1}</b> из <b>{max_page+1}</b>:\n"]
     for u in users:
         st = "✅" if (u.user_id in allowed_ids or is_owner(u.user_id)) else "⛔"
         uname = f"@{h(u.username)}" if u.username else "-"
         nm = h(u.name) if u.name else "-"
         fn = h(u.full_name) if u.full_name else "-"
-        lines.append(f"
-{st} <b>{u.user_id}</b> | {uname} | имя: <b>{nm}</b>
-└ {fn}")
+        lines.append(f"\n{st} <b>{u.user_id}</b> | {uname} | имя: <b>{nm}</b>\n└ {fn}")
 
-    return "
-".join(lines), users, allowed_ids, has_prev, has_next, real_page, total
-
-
+    return "\n".join(lines), users, allowed_ids, has_prev, has_next, real_page, total
 async def render_user_card(uid: int) -> tuple[str, bool]:
     async with Session() as s:
         u = await s.get(User, int(uid))
@@ -1183,29 +1193,27 @@ async def list_sales(message: Message, state: FSMContext):
 
     table_rows = []
     for r in rows:
-        paid = "✅" if r.is_paid else "🧾"
+        paid = "OK" if r.is_paid else "DEBT"
         who = safe_text(r.customer_name) or "-"
-        table_rows.append([
-            str(r.id),
-            str(r.doc_date),
-            who,
-            r.warehouse.name if r.warehouse else "-",
-            r.product.name if r.product else "-",
-            fmt_kg(Decimal(r.qty_kg or 0)),
-            fmt_money(Decimal(r.total_amount or 0)),
-            paid
-        ])
+        wh = r.warehouse.name if r.warehouse else "-"
+        pr = r.product.name if r.product else "-"
+        qty = fmt_kg(Decimal(r.qty_kg or 0))
+        price = fmt_money(Decimal(r.price_per_kg or 0))
+        total = fmt_money(Decimal(r.total_amount or 0))
+        table_rows.append([f"#{r.id}", str(r.doc_date), who, wh, pr, qty, price, total, paid])
 
-    txt = "📄 Продажи (последние 50):
-" + _render_pre_table(
-        headers=["ID", "Дата", "Клиент", "Склад", "Товар", "кг", "Сумма", "Опл"],
+    txt = "📄 <b>Продажи (последние 50)</b>\n" + render_pre_table(
+        headers=["ID", "Дата", "Клиент", "Склад", "Товар", "кг", "цена", "сумма", "стат"],
         rows=table_rows
     )
     await message.answer(txt, parse_mode=ParseMode.HTML)
-    await reply_in_menu(message, state, "Чтобы управлять: напиши `продажа #ID` например: `продажа #12`",
-                        parse_mode=ParseMode.HTML)
 
-
+    await reply_in_menu(
+        message,
+        state,
+        "Чтобы управлять записью: напиши <code>продажа #ID</code> (например <code>продажа #12</code>)",
+        parse_mode=ParseMode.HTML
+    )
 
 @router.message(F.text.regexp(r"(?i)^продажа\s+#\d+$"))
 async def sale_by_id(message: Message, state: FSMContext):
@@ -1277,27 +1285,27 @@ async def list_incomes(message: Message, state: FSMContext):
 
     table_rows = []
     for r in rows:
-        table_rows.append([
-            str(r.id),
-            str(r.doc_date),
-            safe_text(r.supplier_name) or "-",
-            r.warehouse.name if r.warehouse else "-",
-            r.product.name if r.product else "-",
-            fmt_kg(Decimal(r.qty_kg or 0)),
-            fmt_money(Decimal(r.total_amount or 0)),
-            ("✅" if r.add_money_entry else "❌")
-        ])
+        who = safe_text(r.supplier_name) or "-"
+        wh = r.warehouse.name if r.warehouse else "-"
+        pr = r.product.name if r.product else "-"
+        qty = fmt_kg(Decimal(r.qty_kg or 0))
+        price = fmt_money(Decimal(r.price_per_kg or 0))
+        total = fmt_money(Decimal(r.total_amount or 0))
+        money = "OUT" if r.add_money_entry else "-"
+        table_rows.append([f"#{r.id}", str(r.doc_date), who, wh, pr, qty, price, total, money])
 
-    txt = "📄 Приходы (последние 50):
-" + _render_pre_table(
-        headers=["ID", "Дата", "Поставщик", "Склад", "Товар", "кг", "Сумма", "Расх"],
+    txt = "📄 <b>Приходы (последние 50)</b>\n" + render_pre_table(
+        headers=["ID", "Дата", "Поставщик", "Склад", "Товар", "кг", "цена", "сумма", "деньги"],
         rows=table_rows
     )
     await message.answer(txt, parse_mode=ParseMode.HTML)
-    await reply_in_menu(message, state, "Чтобы посмотреть: напиши `приход #ID` например: `приход #7`",
-                        parse_mode=ParseMode.HTML)
 
-
+    await reply_in_menu(
+        message,
+        state,
+        "Чтобы посмотреть/удалить: напиши <code>приход #ID</code> (например <code>приход #7</code>)",
+        parse_mode=ParseMode.HTML
+    )
 
 @router.message(F.text.regexp(r"(?i)^приход\s+#\d+$"))
 async def inc_by_id(message: Message, state: FSMContext):
@@ -1378,28 +1386,24 @@ async def list_debtors(message: Message, state: FSMContext):
 
     table_rows = []
     for r in rows:
-        status = "✅" if r.is_paid else "🧾"
-        table_rows.append([
-            str(r.id),
-            str(r.doc_date),
-            safe_text(r.customer_name) or "-",
-            r.warehouse_name or "-",
-            r.product_name or "-",
-            fmt_kg(Decimal(r.qty_kg or 0)),
-            fmt_money(Decimal(r.total_amount or 0)),
-            status
-        ])
+        status = "PAID" if r.is_paid else "DEBT"
+        qty = fmt_kg(Decimal(r.qty_kg or 0))
+        total = fmt_money(Decimal(r.total_amount or 0))
+        who = safe_text(r.customer_name) or "-"
+        table_rows.append([f"#{r.id}", str(r.doc_date), who, qty, total, status])
 
-    txt = "📋 Должники (последние 50):
-" + _render_pre_table(
-        headers=["ID", "Дата", "Клиент", "Склад", "Товар", "кг", "Сумма", "Ст"],
+    txt = "📋 <b>Должники (последние 50)</b>\n" + render_pre_table(
+        headers=["ID", "Дата", "Клиент", "кг", "сумма", "стат"],
         rows=table_rows
     )
     await message.answer(txt, parse_mode=ParseMode.HTML)
-    await reply_in_menu(message, state, "Чтобы управлять: напиши `должник #ID` например: `должник #3`",
-                        parse_mode=ParseMode.HTML)
 
-
+    await reply_in_menu(
+        message,
+        state,
+        "Чтобы управлять: напиши <code>должник #ID</code> (например <code>должник #3</code>)",
+        parse_mode=ParseMode.HTML
+    )
 
 @router.message(F.text.regexp(r"(?i)^должник\s+#\d+$"))
 async def debtor_by_id(message: Message, state: FSMContext):
