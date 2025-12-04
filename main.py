@@ -1894,7 +1894,7 @@ def interrupt_kb():
 async def cancel_any(message: Message, state: FSMContext):
     await state.clear()
     await set_menu(state, "main")
-    await message.answer("Ок, отменено.", reply_markup=main_menu_kb(is_admin=await is_owner(message.from_user.id)))
+    await message.answer("Ок, отменено.", reply_markup=main_menu_kb(is_admin=is_owner(message.from_user.id)))
 
 @router.message(F.text == "↩️ Продолжить")
 async def continue_any(message: Message, state: FSMContext):
@@ -1902,7 +1902,7 @@ async def continue_any(message: Message, state: FSMContext):
     cur = await state.get_state()
     if not cur:
         await set_menu(state, "main")
-        return await message.answer("Главное меню.", reply_markup=main_menu_kb(is_admin=await is_owner(message.from_user.id)))
+        return await message.answer("Главное меню.", reply_markup=main_menu_kb(is_admin=is_owner(message.from_user.id)))
     # Попробуем вызвать существующие prompt-функции (sale_prompt / income_prompt / debtor_prompt)
     try:
         if "SaleWizard" in cur:
