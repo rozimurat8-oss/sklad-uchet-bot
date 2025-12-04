@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import Message, CallbackQuery
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -1877,7 +1877,7 @@ async def start_debtor(message: Message, state: FSMContext):
     await message.answer("Дата (для должника):", reply_markup=choose_date_kb("deb"))
 
 
-@router.message(F.text)
+@router.message(StateFilter(None), F.text)
 async def menu_router(message: Message, state: FSMContext):
     uid = message.from_user.id
     await upsert_user_from_tg(message.from_user)
