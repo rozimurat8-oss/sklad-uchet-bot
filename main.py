@@ -34,7 +34,7 @@ DB_URL = os.getenv("DB_URL", "sqlite+aiosqlite:////var/data/data.db")
 engine = create_async_engine(DB_URL, echo=False)
 Session = async_sessionmaker(engine, expire_on_commit=False)
 
-OWNER_ID = int(os.getenv("OWNER_ID", "139099578") or 0)  # fixed default owner id
+OWNER_ID = int(os.getenv("OWNER_ID", "139099578") or 0)
 
 print("=== BOOT ===", flush=True)
 print("TOKEN set:", bool(TOKEN), flush=True)
@@ -712,7 +712,7 @@ async def menu_anywhere(message: Message, state: FSMContext):
         page = 0
         txt, users, has_prev, has_next, allowed_ids = await render_users_page(page)
         kb = users_list_kb(page, users, allowed_ids) if users else users_pager_kb(page, has_prev, has_next)
-        return await message.answer(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        return await message.answer(txt, parse_mode=None, reply_markup=kb)
 
     if text_ == "📦 Остатки":
         await state.clear()
@@ -3132,5 +3132,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
 
