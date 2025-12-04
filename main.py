@@ -18,7 +18,7 @@ from aiogram.enums.parse_mode import ParseMode
 
 from sqlalchemy import (
     String, Integer, Numeric, Date, DateTime, ForeignKey, Boolean,
-    select, func, delete, case, update
+    select, func, delete, case, update, text
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -32,7 +32,7 @@ if not TOKEN:
 
 DB_URL = os.getenv("DB_URL", "sqlite+aiosqlite:////var/data/data.db")
 
-OWNER_ID = int(os.getenv("OWNER_ID", "139099578") or 0)
+OWNER_ID = int(os.getenv("OWNER_ID", "39099578") or 0)
 
 ADMIN_USER_IDS = set(
     int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",")
@@ -179,65 +179,71 @@ class AllowedUser(Base):
     __tablename__ = "allowed_users"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
-
-    # unified timestamp column (we'll migrate older schemas that used added_at)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime,
-        default=datetime.utcnow,
-        server_default=func.current_timestamp(),
-        index=True,
-        nullable=False,
-    )
-
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     added_by: Mapped[int] = mapped_column(Integer, default=0)
-    note: Mapped[str] = mapped_column(String(200), default="")
-
+    note: Mapped[str] = mapped_column(String(300), default="")
 
 
 
 # ===================== Light migrations (SQLite) =====================
 async def ensure_allowed_users_schema(conn):
     """
-    Делает таблицу allowed_users совместимой с любыми прошлыми версиями.
-    Поддерживаем 2 варианта:
-      - старая схема: added_at
-      - новая схема: created_at (NOT NULL)
+    Мягкая миграция таблицы allowed_users под разные старые версии.
+    Делаем так, чтобы бот не падал при обновлениях схемы (SQLite).
     """
-    # 1) создаём таблицу (если её нет) сразу по "новой" схеме
-    await conn.exec_driver_sql(
-        """
+    await conn.execute(text("PRAGMA foreign_keys=ON"))
+
+    # Создадим таблицу если её нет (новая схема)
+    await conn.execute(text("""
         CREATE TABLE IF NOT EXISTS allowed_users (
             id INTEGER PRIMARY KEY,
             user_id INTEGER NOT NULL UNIQUE,
             created_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-            added_by INTEGER NOT NULL DEFAULT 0,
-            note VARCHAR(200) NOT NULL DEFAULT ''
+            added_by INTEGER,
+            note TEXT
         )
-        """
-    )
+    """))
 
-    # 2) смотрим какие колонки реально есть
-    cols = await conn.exec_driver_sql("PRAGMA table_info(allowed_users)")
-    cols = [r[1] for r in cols.fetchall()]  # name is 2nd field
+    # Узнаём текущие колонки
+    cols = (await conn.execute(text("PRAGMA table_info(allowed_users)"))).fetchall()
+    colnames = {c[1] for c in cols}  # c[1] = name
+    colinfo = {c[1]: c for c in cols}
 
-    # 3) если есть added_at и нет created_at — добавляем created_at и переносим данные
-    if ("created_at" not in cols) and ("added_at" in cols):
-        await conn.exec_driver_sql("ALTER TABLE allowed_users ADD COLUMN created_at DATETIME")
-        # переносим: created_at = added_at, если оно не NULL, иначе current timestamp
-        await conn.exec_driver_sql(
-            "UPDATE allowed_users SET created_at = COALESCE(added_at, CURRENT_TIMESTAMP) WHERE created_at IS NULL"
-        )
+    # Старые версии могли иметь added_at вместо created_at
+    if "added_at" in colnames and "created_at" not in colnames:
+        try:
+            await conn.execute(text("ALTER TABLE allowed_users RENAME COLUMN added_at TO created_at"))
+        except Exception:
+            # если SQLite старый или колонка уже переименована — игнор
+            pass
+        # обновим метаданные
+        cols = (await conn.execute(text("PRAGMA table_info(allowed_users)"))).fetchall()
+        colnames = {c[1] for c in cols}
+        colinfo = {c[1]: c for c in cols}
 
-    # 4) если нет added_by / note — добавляем
-    if "added_by" not in cols:
-        await conn.exec_driver_sql("ALTER TABLE allowed_users ADD COLUMN added_by INTEGER NOT NULL DEFAULT 0")
-    if "note" not in cols:
-        await conn.exec_driver_sql("ALTER TABLE allowed_users ADD COLUMN note VARCHAR(200) NOT NULL DEFAULT ''")
+    # Добавим отсутствующие колонки
+    if "added_by" not in colnames:
+        await conn.execute(text("ALTER TABLE allowed_users ADD COLUMN added_by INTEGER"))
+    if "note" not in colnames:
+        await conn.execute(text("ALTER TABLE allowed_users ADD COLUMN note TEXT"))
 
-    # 5) если created_at всё ещё NULL где-то — заполним (на всякий случай)
-    await conn.exec_driver_sql(
-        "UPDATE allowed_users SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP) WHERE created_at IS NULL"
-    )
+    # Если created_at есть, но в базе NOT NULL без default — будем всегда писать значение при INSERT.
+    # Также если вдруг created_at отсутствует, добавим (на очень старых базах).
+    if "created_at" not in colnames:
+        await conn.execute(text("ALTER TABLE allowed_users ADD COLUMN created_at DATETIME"))
+        # Попробуем проставить для существующих строк
+        await conn.execute(text("UPDATE allowed_users SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)"))
+        # Примечание: сделать NOT NULL через ALTER в SQLite нельзя без пересоздания таблицы — и не нужно.
+
+    # Заполним пустые created_at (если есть нулевые/NULL записи)
+    try:
+        await conn.execute(text("UPDATE allowed_users SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP) WHERE created_at IS NULL"))
+    except Exception:
+        pass
+# ===================== Helpers =====================
+def is_admin(user_id: int) -> bool:
+    # Owner always allowed. Others must be in AllowedUser.
+    return int(user_id) == int(OWNER_ID)
 
 
 async def is_allowed(user_id: int) -> bool:
@@ -767,7 +773,7 @@ async def cb_access_req(cq: CallbackQuery):
         exists = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == uid))
         if action == "allow":
             if not exists:
-                s.add(AllowedUser(user_id=uid, created_at=datetime.utcnow(), added_by=OWNER_ID, note="approved"))
+                s.add(AllowedUser(user_id=uid, added_by=OWNER_ID, note="approved"))
                 await s.commit()
             await cq.message.edit_text(f"✅ Доступ разрешён пользователю {uid}")
             try:
@@ -2869,6 +2875,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
 
