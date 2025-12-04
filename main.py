@@ -276,7 +276,7 @@ def safe_phone(s: str) -> str:
 
 
 def h(s: str) -> str:
-    return html.escape((s or \"\").strip(), quote=False)
+    return html.escape((s or "").strip(), quote=False)
 def parse_cb(data: str, prefix: str):
     if not data or not data.startswith(prefix + ":"):
         return []
@@ -3247,4 +3247,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
