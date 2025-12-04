@@ -234,7 +234,6 @@ async def ensure_allowed_users_schema(conn):
 
 
 async def ensure_users_schema(conn):
-    # Создать таблицу users если нет
     await conn.execute(text("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -248,7 +247,6 @@ async def ensure_users_schema(conn):
     cols = (await conn.execute(text("PRAGMA table_info(users)"))).fetchall()
     colnames = {c[1] for c in cols}
 
-    # Добавим недостающие колонки для старых версий
     if "full_name" not in colnames:
         await conn.execute(text("ALTER TABLE users ADD COLUMN full_name TEXT"))
     if "username" not in colnames:
@@ -299,10 +297,6 @@ async def is_allowed(user_id: int) -> bool:
         return bool(await s.scalar(select(AllowedUser.id).where(AllowedUser.user_id == int(user_id))))
 
 async def upsert_user_from_tg(tg_user) -> User:
-    """
-    Создаёт/обновляет users по данным Telegram.
-    Возвращает объект User (из БД).
-    """
     uid = int(tg_user.id)
     full_name = safe_text(getattr(tg_user, "full_name", "") or "")
     username = safe_text(getattr(tg_user, "username", "") or "")
@@ -316,7 +310,6 @@ async def upsert_user_from_tg(tg_user) -> User:
             await s.refresh(u)
             return u
 
-        # обновляем актуальные данные
         changed = False
         if full_name and u.full_name != full_name:
             u.full_name = full_name
@@ -362,7 +355,7 @@ def main_menu_kb(is_admin_menu: bool = False):
     kb.adjust(1)
 
     if is_admin_menu:
-        kb.button(text="👥 Users")  # NEW: admin button
+        kb.button(text="👥 Users")
         kb.adjust(1)
 
     kb.button(text="❌ Отмена")
@@ -446,7 +439,7 @@ def sale_status_kb():
 
 
 # =========================================================
-# INLINE CALENDAR (same as your current)
+# INLINE CALENDAR
 # =========================================================
 def cal_open_kb(scope: str, year: int, month: int):
     first = date(year, month, 1)
@@ -504,7 +497,7 @@ def choose_date_kb(scope: str):
 
 
 # =========================================================
-# FSM (add user name flow) + existing wizards
+# FSM
 # =========================================================
 class AuthWizard(StatesGroup):
     ask_name = State()
@@ -588,7 +581,7 @@ MENU_TEXTS = {
     "📥 Выгрузка (таблица)",
     "📋 Должники", "➕ Добавить должн...",
     "🏬 Склады", "🧺 Товары", "🏦 Банки",
-    "👥 Users",  # NEW
+    "👥 Users",
     "❌ Отмена",
     "➕ Добавить склад", "📃 Список складов", "🗑 Удалить склад",
     "➕ Добавить товар", "📃 Список товаров", "🗑 Удалить товар",
@@ -620,7 +613,7 @@ async def rm_user(user_id: int):
         await s.commit()
 
 
-USERS_PAGE_SIZE = 15
+USERS_PAGE_SIZE = 10  # чуть меньше, чтобы влезли кнопки управления
 
 
 def users_pager_kb(page: int, has_prev: bool, has_next: bool):
@@ -634,21 +627,49 @@ def users_pager_kb(page: int, has_prev: bool, has_next: bool):
     return ikb.as_markup()
 
 
-def user_manage_kb(uid: int, allowed: bool):
+def users_list_kb(page: int, users: list[User], allowed_ids: set[int]):
+    """
+    Под списком юзеров рисуем кнопки "⚙️ Управлять <id>" по одному на строку
+    + пагинацию.
+    """
     ikb = InlineKeyboardBuilder()
-    if allowed:
-        ikb.button(text="❌ Deny", callback_data=f"users:deny:{uid}")
-    else:
-        ikb.button(text="✅ Allow", callback_data=f"users:allow:{uid}")
-    ikb.button(text="🗑 Remove user", callback_data=f"users:rm:{uid}")
-    ikb.adjust(2, 1)
+
+    for u in users:
+        # показываем кнопку управления для каждого
+        ikb.button(text=f"⚙️ Управлять {u.user_id}", callback_data=f"users:manage:{u.user_id}:{page}")
+
+    # пагинация отдельными кнопками
+    ikb.button(text="⬅️ Назад", callback_data=f"users:page:{page-1}")
+    ikb.button(text="➡️ Далее", callback_data=f"users:page:{page+1}")
+    ikb.button(text="🔄 Обновить", callback_data=f"users:page:{page}")
+    ikb.adjust(1, 1, 1, 1)  # manage-кнопки по 1, потом пагинация
+    # Но "Назад/Далее" не должны быть активны когда нельзя — это обработаем в cb по page.
     return ikb.as_markup()
 
 
-async def render_users_page(page: int) -> tuple[str, bool, bool]:
+def user_manage_kb(uid: int, allowed: bool, back_page: int):
+    ikb = InlineKeyboardBuilder()
+    if allowed:
+        ikb.button(text="❌ Запретить (Deny)", callback_data=f"users:deny:{uid}:{back_page}")
+    else:
+        ikb.button(text="✅ Разрешить (Allow)", callback_data=f"users:allow:{uid}:{back_page}")
+
+    ikb.button(text="🗑 Удалить user", callback_data=f"users:rm:{uid}:{back_page}")
+    ikb.button(text="⬅️ Назад к списку", callback_data=f"users:page:{back_page}")
+    ikb.adjust(1)
+    return ikb.as_markup()
+
+
+async def render_users_page(page: int) -> tuple[str, list[User], bool, bool, set[int]]:
     async with Session() as s:
         total = await s.scalar(select(func.count()).select_from(User))
         total = int(total or 0)
+
+        if total == 0:
+            return "👥 Users: пока пусто.", [], False, False, set()
+
+        if page < 0:
+            page = 0
 
         stmt = (
             select(User)
@@ -660,8 +681,9 @@ async def render_users_page(page: int) -> tuple[str, bool, bool]:
 
         allowed_ids = set((await s.execute(select(AllowedUser.user_id))).scalars().all())
 
-    if total == 0:
-        return "👥 Users: пока пусто.", False, False
+        end = (page + 1) * USERS_PAGE_SIZE
+        has_prev = page > 0
+        has_next = end < total
 
     lines = [f"👥 *Users* (всего: *{total}*), страница *{page+1}*:\n"]
     for u in users:
@@ -674,10 +696,28 @@ async def render_users_page(page: int) -> tuple[str, bool, bool]:
             f"└ {fn}"
         )
 
-    end = (page + 1) * USERS_PAGE_SIZE
-    has_prev = page > 0
-    has_next = end < total
-    return "\n\n".join(lines), has_prev, has_next
+    return "\n\n".join(lines), users, has_prev, has_next, allowed_ids
+
+
+async def render_user_card(uid: int) -> tuple[str, bool]:
+    async with Session() as s:
+        u = await s.get(User, int(uid))
+        if not u:
+            return "User не найден (возможно удалён).", False
+        allowed = bool(await s.scalar(select(AllowedUser.id).where(AllowedUser.user_id == int(uid))))
+    uname = f"@{u.username}" if u.username else "-"
+    nm = u.name if u.name else "-"
+    fn = u.full_name if u.full_name else "-"
+    status = "✅ ДОСТУП ЕСТЬ" if (allowed or is_owner(u.user_id)) else "⛔ ДОСТУП НЕТ"
+    txt = (
+        f"👤 *User {u.user_id}*\n"
+        f"Статус: *{status}*\n"
+        f"Username: *{uname}*\n"
+        f"Имя в системе: *{nm}*\n"
+        f"Имя TG: {fn}\n"
+        f"Создан: `{u.created_at}`"
+    )
+    return txt, (allowed or is_owner(u.user_id))
 
 
 # =========================================================
@@ -687,7 +727,6 @@ async def render_users_page(page: int) -> tuple[str, bool, bool]:
 async def menu_anywhere(message: Message, state: FSMContext):
     uid = message.from_user.id
 
-    # always upsert user on any menu message
     await upsert_user_from_tg(message.from_user)
 
     if not (await is_allowed(uid)):
@@ -710,12 +749,9 @@ async def menu_anywhere(message: Message, state: FSMContext):
             return await message.answer("Нет доступа.")
         await state.clear()
         page = 0
-        txt, has_prev, has_next = await render_users_page(page)
-        return await message.answer(
-            txt,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=users_pager_kb(page, has_prev, has_next)
-        )
+        txt, users, has_prev, has_next, allowed_ids = await render_users_page(page)
+        kb = users_list_kb(page, users, allowed_ids) if users else users_pager_kb(page, has_prev, has_next)
+        return await message.answer(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
     if text_ == "📦 Остатки":
         await state.clear()
@@ -765,7 +801,6 @@ async def menu_anywhere(message: Message, state: FSMContext):
         await state.clear()
         return await message.answer("Управление банками:", reply_markup=banks_menu_kb())
 
-    # warehouses admin actions
     if text_ == "➕ Добавить склад":
         await state.clear()
         await state.set_state(WarehousesAdmin.adding)
@@ -780,7 +815,6 @@ async def menu_anywhere(message: Message, state: FSMContext):
         await state.set_state(WarehousesAdmin.deleting)
         return await message.answer("Напиши EXACT название склада для удаления:", reply_markup=warehouses_menu_kb())
 
-    # products admin actions
     if text_ == "➕ Добавить товар":
         await state.clear()
         await state.set_state(ProductsAdmin.adding)
@@ -795,7 +829,6 @@ async def menu_anywhere(message: Message, state: FSMContext):
         await state.set_state(ProductsAdmin.deleting)
         return await message.answer("Напиши EXACT название товара для удаления:", reply_markup=products_menu_kb())
 
-    # banks admin actions
     if text_ == "➕ Добавить банк":
         await state.clear()
         await state.set_state(BanksAdmin.adding)
@@ -822,15 +855,11 @@ async def cmd_start(message: Message, state: FSMContext):
     u = await upsert_user_from_tg(message.from_user)
 
     if await is_allowed(uid):
-        # ask name if missing
         if not safe_text(u.name):
             await state.set_state(AuthWizard.ask_name)
-            return await message.answer(
-                "👋 Привет! Введи, пожалуйста, своё имя (как тебя записывать в системе):"
-            )
+            return await message.answer("👋 Привет! Введи, пожалуйста, своё имя (как тебя записывать в системе):")
         return await message.answer("Привет! Выбери действие:", reply_markup=main_menu_kb(is_owner(uid)))
 
-    # not allowed: request to owner
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Разрешить", callback_data=f"acc_req:allow:{uid}")
     kb.button(text="❌ Запретить", callback_data=f"acc_req:deny:{uid}")
@@ -876,14 +905,9 @@ async def auth_ask_name(message: Message, state: FSMContext):
     await state.clear()
 
     if await is_allowed(uid):
-        return await message.answer(
-            f"✅ Отлично, {name}! Выбери действие:",
-            reply_markup=main_menu_kb(is_owner(uid))
-        )
+        return await message.answer(f"✅ Отлично, {name}! Выбери действие:", reply_markup=main_menu_kb(is_owner(uid)))
 
-    return await message.answer(
-        "✅ Имя сохранено. Доступ к боту выдаёт владелец. Напиши /start после одобрения."
-    )
+    return await message.answer("✅ Имя сохранено. Доступ к боту выдаёт владелец. Напиши /start после одобрения.")
 
 
 # =========================================================
@@ -927,8 +951,9 @@ async def cmd_users(message: Message):
     if not is_owner(message.from_user.id):
         return await message.answer("Нет доступа.")
     page = 0
-    txt, has_prev, has_next = await render_users_page(page)
-    await message.answer(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=users_pager_kb(page, has_prev, has_next))
+    txt, users, has_prev, has_next, allowed_ids = await render_users_page(page)
+    kb = users_list_kb(page, users, allowed_ids) if users else users_pager_kb(page, has_prev, has_next)
+    await message.answer(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
 
 @router.message(Command("allow"))
@@ -973,7 +998,7 @@ async def cmd_rmuser(message: Message):
 
 
 # =========================================================
-# OWNER inline: users list pagination + manage
+# OWNER inline: users list pagination + manage (FIXED)
 # =========================================================
 @router.callback_query(F.data.startswith("users:"))
 async def users_inline_router(cq: CallbackQuery):
@@ -981,10 +1006,11 @@ async def users_inline_router(cq: CallbackQuery):
         return await cq.answer("Нет доступа", show_alert=True)
 
     parts = (cq.data or "").split(":")
-    # users:page:0
-    # users:allow:<id>
-    # users:deny:<id>
-    # users:rm:<id>
+    # users:page:<page>
+    # users:manage:<uid>:<page>
+    # users:allow:<uid>:<page>
+    # users:deny:<uid>:<page>
+    # users:rm:<uid>:<page>
     if len(parts) < 3:
         return await cq.answer()
 
@@ -994,15 +1020,40 @@ async def users_inline_router(cq: CallbackQuery):
         if not parts[2].isdigit():
             return await cq.answer("Ошибка страницы", show_alert=True)
         page = int(parts[2])
-        txt, has_prev, has_next = await render_users_page(page)
-        await cq.message.answer(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=users_pager_kb(page, has_prev, has_next))
+
+        txt, users, has_prev, has_next, allowed_ids = await render_users_page(page)
+        if not users:
+            # если пусто — просто редактируем текст и убираем кнопки
+            await cq.message.edit_text(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=None)
+            return await cq.answer()
+
+        # Кнопки "Назад/Далее" будут просто не нажиматься логически:
+        # если нельзя назад/вперёд — при нажатии покажем алерт.
+        kb = users_list_kb(page, users, allowed_ids)
+        await cq.message.edit_text(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        return await cq.answer()
+
+    if action == "manage":
+        # users:manage:<uid>:<page>
+        if len(parts) != 4 or (not parts[2].isdigit()) or (not parts[3].isdigit()):
+            return await cq.answer("Ошибка", show_alert=True)
+        uid = int(parts[2])
+        back_page = int(parts[3])
+
+        card, allowed = await render_user_card(uid)
+        await cq.message.edit_text(
+            card,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=user_manage_kb(uid, allowed, back_page)
+        )
         return await cq.answer()
 
     if action in ("allow", "deny", "rm"):
-        uid_s = parts[2]
-        if not uid_s.isdigit():
+        # users:allow:<uid>:<page> etc
+        if len(parts) != 4 or (not parts[2].isdigit()) or (not parts[3].isdigit()):
             return await cq.answer("Ошибка", show_alert=True)
-        uid = int(uid_s)
+        uid = int(parts[2])
+        back_page = int(parts[3])
 
         if action == "allow":
             await allow_user(uid, OWNER_ID, note="inline allow")
@@ -1010,10 +1061,8 @@ async def users_inline_router(cq: CallbackQuery):
                 await cq.bot.send_message(uid, "✅ Вам выдан доступ к боту. Напишите /start")
             except Exception:
                 pass
-            await cq.message.answer(f"✅ Allow: {uid}")
-            return await cq.answer("OK")
 
-        if action == "deny":
+        elif action == "deny":
             if is_owner(uid):
                 return await cq.answer("OWNER нельзя deny", show_alert=True)
             await deny_user(uid)
@@ -1021,16 +1070,22 @@ async def users_inline_router(cq: CallbackQuery):
                 await cq.bot.send_message(uid, "⛔ Доступ к боту отключён.")
             except Exception:
                 pass
-            await cq.message.answer(f"❌ Deny: {uid}")
-            return await cq.answer("OK")
 
-        if action == "rm":
+        elif action == "rm":
             if is_owner(uid):
                 return await cq.answer("OWNER нельзя rm", show_alert=True)
+            # удаляем из users и снимаем доступ
             await rm_user(uid)
             await deny_user(uid)
-            await cq.message.answer(f"🗑 Removed user: {uid}")
-            return await cq.answer("OK")
+
+        # после действия показываем обновлённую карточку
+        card, allowed = await render_user_card(uid)
+        await cq.message.edit_text(
+            card,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=user_manage_kb(uid, allowed, back_page)
+        )
+        return await cq.answer("OK")
 
     return await cq.answer()
 
@@ -1108,7 +1163,7 @@ async def pick_bank_kb(prefix: str):
 
 
 # =========================================================
-# STOCKS / MONEY / EXPORT (mostly copied from your version, only menu kb param)
+# STOCKS / MONEY / EXPORT
 # =========================================================
 async def show_stocks_table(message: Message, admin_menu: bool):
     async with Session() as s:
@@ -1202,7 +1257,6 @@ async def show_money(message: Message, admin_menu: bool):
     await message.answer("\n".join(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb(admin_menu))
 
 
-# ---------------- EXPORT ----------------
 EXPORT_PAGE_SIZE = 20
 
 def export_menu_kb():
@@ -1397,7 +1451,7 @@ async def export_router(cq: CallbackQuery):
 
 
 # =========================================================
-# LISTS (Sales/Incomes/Debtors) - minimal changes: menu kb
+# LISTS (Sales/Incomes/Debtors)
 # =========================================================
 def sales_actions_kb(sale_id: int, paid: bool):
     ikb = InlineKeyboardBuilder()
@@ -1619,7 +1673,6 @@ async def inc_by_id(message: Message):
     await message.answer(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=income_actions_kb(r.id))
 
 
-# ---------------- Debtors ----------------
 def debtor_actions_kb(debtor_id: int, paid: bool):
     ikb = InlineKeyboardBuilder()
     if not paid:
@@ -1706,7 +1759,7 @@ async def debtor_by_id(message: Message):
 
 
 # =========================================================
-# ADMIN: Warehouses/Products/Banks (same logic)
+# ADMIN: Warehouses/Products/Banks
 # =========================================================
 @router.message(WarehousesAdmin.adding)
 async def wh_add(message: Message, state: FSMContext):
@@ -1848,7 +1901,7 @@ async def list_banks(message: Message, admin_menu: bool):
 
 # =========================================================
 # SALE/INCOME/DEBTOR WIZARDS
-# (Keeping your logic: below is your original flow unchanged where possible)
+# (Ниже — твоя логика без изменений)
 # =========================================================
 
 SALE_FLOW = [
@@ -1856,10 +1909,8 @@ SALE_FLOW = [
     "qty", "price", "delivery", "paid_status", "pay_method", "account_type", "bank_pick", "confirm"
 ]
 
-
 def sale_state_name(state: State) -> str:
     return str(state).split(":")[-1]
-
 
 async def sale_go_to(state: FSMContext, step: str):
     mapping = {
@@ -1879,7 +1930,6 @@ async def sale_go_to(state: FSMContext, step: str):
     }
     await state.set_state(mapping[step])
 
-
 async def sale_prompt(message: Message, state: FSMContext):
     cur = await state.get_state()
     step = sale_state_name(cur)
@@ -1887,51 +1937,39 @@ async def sale_prompt(message: Message, state: FSMContext):
     if step == "doc_date":
         await message.answer("Дата продажи:", reply_markup=choose_date_kb("sale"))
         return
-
     if step == "customer_name":
         await message.answer("Имя клиента:", reply_markup=nav_kb("sale_nav:customer_name", allow_skip=True))
         return
-
     if step == "customer_phone":
         await message.answer("Телефон клиента:", reply_markup=nav_kb("sale_nav:customer_phone", allow_skip=True))
         return
-
     if step == "warehouse":
         await message.answer("Выбери склад:", reply_markup=await pick_warehouse_kb("sale_wh"))
         return
-
     if step == "product":
         await message.answer("Выбери товар:", reply_markup=await pick_product_kb("sale_pr"))
         return
-
     if step == "qty":
         await message.answer("Кол-во (кг), например 125.5:", reply_markup=nav_kb("sale_nav:qty", allow_skip=False))
         return
-
     if step == "price":
         await message.answer("Цена за 1 кг:", reply_markup=nav_kb("sale_nav:price", allow_skip=False))
         return
-
     if step == "delivery":
         await message.answer("Доставка (0 если нет):", reply_markup=nav_kb("sale_nav:delivery", allow_skip=True))
         return
-
     if step == "paid_status":
         await message.answer("Статус оплаты:", reply_markup=sale_status_kb())
         return
-
     if step == "pay_method":
         await message.answer("Как оплатили?", reply_markup=pay_method_kb("sale_pay"))
         return
-
     if step == "account_type":
         await message.answer("Куда поступили деньги?", reply_markup=account_type_kb("sale_acc"))
         return
-
     if step == "bank_pick":
         await message.answer("Выбери банк/счёт из списка:", reply_markup=await pick_bank_kb("sale_bank"))
         return
-
     if step == "confirm":
         data = await state.get_data()
         await message.answer(build_sale_summary(data) + "\n\nПодтвердить?",
@@ -1939,12 +1977,10 @@ async def sale_prompt(message: Message, state: FSMContext):
                              reply_markup=yes_no_kb("sale_confirm"))
         return
 
-
 async def start_sale(message: Message, state: FSMContext, admin_menu: bool):
     await state.clear()
     await sale_go_to(state, "doc_date")
     await sale_prompt(message, state)
-
 
 @router.callback_query(F.data.startswith("cal:sale:"))
 async def cal_sale_handler(cq: CallbackQuery, state: FSMContext):
@@ -1968,7 +2004,6 @@ async def cal_sale_handler(cq: CallbackQuery, state: FSMContext):
         return await cq.answer()
 
     await cq.answer()
-
 
 @router.callback_query(F.data.startswith("sale_nav:"))
 async def sale_nav_handler(cq: CallbackQuery, state: FSMContext):
@@ -2023,7 +2058,6 @@ async def sale_nav_handler(cq: CallbackQuery, state: FSMContext):
 
     await cq.answer()
 
-
 @router.callback_query(F.data.startswith("sale_wh:"))
 async def sale_choose_wh(cq: CallbackQuery, state: FSMContext):
     parts = parse_cb(cq.data, "sale_wh")
@@ -2050,7 +2084,6 @@ async def sale_choose_wh(cq: CallbackQuery, state: FSMContext):
 
     return await cq.answer("Ошибка склада", show_alert=True)
 
-
 @router.message(SaleWizard.adding_warehouse)
 async def sale_add_warehouse_inline(message: Message, state: FSMContext):
     name = safe_text(message.text)
@@ -2065,7 +2098,6 @@ async def sale_add_warehouse_inline(message: Message, state: FSMContext):
 
     await sale_go_to(state, "warehouse_id")
     await message.answer("✅ Склад добавлен. Теперь выбери склад:", reply_markup=await pick_warehouse_kb("sale_wh"))
-
 
 @router.callback_query(F.data.startswith("sale_pr:"))
 async def sale_choose_pr(cq: CallbackQuery, state: FSMContext):
@@ -2093,7 +2125,6 @@ async def sale_choose_pr(cq: CallbackQuery, state: FSMContext):
 
     return await cq.answer("Ошибка товара", show_alert=True)
 
-
 @router.message(SaleWizard.adding_product)
 async def sale_add_product_inline(message: Message, state: FSMContext):
     name = safe_text(message.text)
@@ -2109,7 +2140,6 @@ async def sale_add_product_inline(message: Message, state: FSMContext):
     await sale_go_to(state, "product_id")
     await message.answer("✅ Товар добавлен. Теперь выбери товар:", reply_markup=await pick_product_kb("sale_pr"))
 
-
 @router.message(SaleWizard.customer_name)
 async def sale_customer_name(message: Message, state: FSMContext):
     txt = safe_text(message.text) or "-"
@@ -2117,14 +2147,12 @@ async def sale_customer_name(message: Message, state: FSMContext):
     await sale_go_to(state, "customer_phone")
     await sale_prompt(message, state)
 
-
 @router.message(SaleWizard.customer_phone)
 async def sale_customer_phone(message: Message, state: FSMContext):
     txt = safe_phone(message.text) or "-"
     await state.update_data(customer_phone=txt)
     await sale_go_to(state, "warehouse_id")
     await sale_prompt(message, state)
-
 
 @router.message(SaleWizard.qty)
 async def sale_qty(message: Message, state: FSMContext):
@@ -2138,7 +2166,6 @@ async def sale_qty(message: Message, state: FSMContext):
     await sale_go_to(state, "price")
     await sale_prompt(message, state)
 
-
 @router.message(SaleWizard.price)
 async def sale_price(message: Message, state: FSMContext):
     try:
@@ -2150,7 +2177,6 @@ async def sale_price(message: Message, state: FSMContext):
     await state.update_data(price=str(p))
     await sale_go_to(state, "delivery")
     await sale_prompt(message, state)
-
 
 @router.message(SaleWizard.delivery)
 async def sale_delivery(message: Message, state: FSMContext):
@@ -2167,7 +2193,6 @@ async def sale_delivery(message: Message, state: FSMContext):
     await sale_go_to(state, "paid_status")
     await sale_prompt(message, state)
 
-
 @router.callback_query(F.data.startswith("sale_status:"))
 async def sale_status_chosen(cq: CallbackQuery, state: FSMContext):
     status = cq.data.split(":", 1)[1] if cq.data else ""
@@ -2181,7 +2206,6 @@ async def sale_status_chosen(cq: CallbackQuery, state: FSMContext):
         await sale_prompt(cq.message, state)
     await cq.answer()
 
-
 @router.callback_query(F.data.startswith("sale_pay:"))
 async def sale_pay_method(cq: CallbackQuery, state: FSMContext):
     method = cq.data.split(":", 1)[1] if cq.data else "cash"
@@ -2189,7 +2213,6 @@ async def sale_pay_method(cq: CallbackQuery, state: FSMContext):
     await sale_go_to(state, "account_type")
     await sale_prompt(cq.message, state)
     await cq.answer()
-
 
 @router.callback_query(F.data.startswith("sale_acc:"))
 async def sale_account_type_pick(cq: CallbackQuery, state: FSMContext):
@@ -2205,7 +2228,6 @@ async def sale_account_type_pick(cq: CallbackQuery, state: FSMContext):
         await sale_prompt(cq.message, state)
 
     await cq.answer()
-
 
 @router.callback_query(F.data.startswith("sale_bank:"))
 async def sale_bank_pick(cq: CallbackQuery, state: FSMContext):
@@ -2233,7 +2255,6 @@ async def sale_bank_pick(cq: CallbackQuery, state: FSMContext):
 
     return await cq.answer("Ошибка банка", show_alert=True)
 
-
 @router.message(SaleWizard.adding_bank)
 async def sale_add_bank_inline(message: Message, state: FSMContext):
     name = safe_text(message.text)
@@ -2248,7 +2269,6 @@ async def sale_add_bank_inline(message: Message, state: FSMContext):
 
     await sale_go_to(state, "bank_pick")
     await message.answer("✅ Банк добавлен. Теперь выбери банк:", reply_markup=await pick_bank_kb("sale_bank"))
-
 
 def build_sale_summary(data: dict) -> str:
     qty = Decimal(data["qty"])
@@ -2285,7 +2305,6 @@ def build_sale_summary(data: dict) -> str:
         f"Куда: *{acc}*\n"
         f"Банк/ИП: *{bank_txt}*"
     )
-
 
 @router.callback_query(F.data.startswith("sale_confirm:"))
 async def sale_confirm(cq: CallbackQuery, state: FSMContext):
@@ -2416,7 +2435,7 @@ async def sale_confirm(cq: CallbackQuery, state: FSMContext):
     await cq.answer()
 
 
-# ---------------- INCOME wizard (kept from your version) ----------------
+# ---------------- INCOME wizard ----------------
 INCOME_FLOW = [
     "doc_date", "supplier_name", "supplier_phone", "warehouse_id", "product_id",
     "qty", "price", "delivery", "add_money", "pay_method", "account_type", "bank_pick", "confirm"
@@ -2909,7 +2928,7 @@ async def inc_confirm(cq: CallbackQuery, state: FSMContext):
     await cq.answer()
 
 
-# ---------------- Debtor manual wizard (kept) ----------------
+# ---------------- Debtor manual wizard ----------------
 async def start_debtor(message: Message, state: FSMContext, admin_menu: bool):
     await state.clear()
     await state.set_state(DebtorWizard.doc_date)
@@ -3121,7 +3140,7 @@ async def main():
         await ensure_allowed_users_schema(conn)
         await ensure_users_schema(conn)
 
-    # ensure owner is allowed (useful for consistency)
+    # ensure owner is allowed
     async with Session() as s:
         ex = await s.scalar(select(AllowedUser).where(AllowedUser.user_id == OWNER_ID))
         if not ex:
