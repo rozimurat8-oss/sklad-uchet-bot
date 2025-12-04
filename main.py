@@ -35,7 +35,7 @@ DB_URL = os.getenv("DB_URL", "sqlite+aiosqlite:////var/data/data.db")
 engine = create_async_engine(DB_URL, echo=False)
 Session = async_sessionmaker(engine, expire_on_commit=False)
 
-OWNER_ID = int(os.getenv("OWNER_ID", "39099578") or 0)
+OWNER_ID = int(os.getenv("OWNER_ID", "139099578") or 0)
 
 ADMIN_USER_IDS = set(
     int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",")
@@ -2878,3 +2878,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
